@@ -151,7 +151,13 @@ def sms_inbound():
 
     user = db.get_user_by_phone(from_number)
     if not user:
-        return _twiml("Sorry, I don't recognize this number. Connect your Strava account first.")
+        public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
+        encoded_phone = urllib.parse.quote(from_number)
+        auth_url = f"{public_url}/auth?phone={encoded_phone}"
+        return _twiml(
+            f"Welcome! To get started, connect your Strava account by visiting this link:\n{auth_url}\n\n"
+            f"Once connected, I'll text you your CdA after every outdoor ride."
+        )
 
     if _wants_to_change_weight(body):
         db.set_awaiting_weight(user["athlete_id"], True)
