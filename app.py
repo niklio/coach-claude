@@ -1,15 +1,20 @@
+import base64
+import json
 import logging
 import os
+import re
 import threading
 import traceback
+import urllib.parse
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request
+from twilio.twiml.messaging_response import MessagingResponse
 
 import cda_calculator
+import db
 import sms_sender
 import strava_client
-import token_store
 
 load_dotenv()
 
@@ -22,9 +27,11 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me")
 
+db.init_db()
+
 
 # ---------------------------------------------------------------------------
-# Strava webhook verification (GET) + event handler (POST)
+# Strava webhook
 # ---------------------------------------------------------------------------
 
 @app.route("/webhook", methods=["GET"])
@@ -33,65 +40,74 @@ def webhook_verify():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
     if mode == "subscribe" and token == os.getenv("STRAVA_WEBHOOK_VERIFY_TOKEN"):
-        log.info("Webhook verified by Strava.")
         return jsonify({"hub.challenge": challenge}), 200
-    log.warning("Webhook verification failed: mode=%s token=%s", mode, token)
     return "Forbidden", 403
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook_event():
     data = request.get_json(force=True) or {}
-    log.info("Webhook event received: %s", data)
-
     if data.get("object_type") == "activity" and data.get("aspect_type") == "create":
         activity_id = data.get("object_id")
-        if activity_id:
-            t = threading.Thread(target=_process_activity, args=(activity_id,), daemon=True)
+        athlete_id = data.get("owner_id")
+        if activity_id and athlete_id:
+            t = threading.Thread(
+                target=_process_activity, args=(activity_id, athlete_id), daemon=True
+            )
             t.start()
-
-    # Always return 200 immediately — Strava will retry if we don't
     return "OK", 200
 
 
-def _process_activity(activity_id: int) -> None:
+def _process_activity(activity_id: int, athlete_id: int) -> None:
     try:
-        log.info("Fetching activity %d ...", activity_id)
-        activity = strava_client.get_activity(activity_id)
+        user = db.get_user_by_athlete(athlete_id)
+        if not user:
+            log.warning("No user found for athlete_id %d — skipping.", athlete_id)
+            return
+
+        # Refresh token if needed and persist
+        access, refresh, expires = strava_client.refresh_if_needed(
+            user["access_token"], user["refresh_token"], user["expires_at"]
+        )
+        if access != user["access_token"]:
+            db.update_tokens(athlete_id, access, refresh, expires)
+
+        activity = strava_client.get_activity(activity_id, access)
 
         activity_type = activity.get("type", "")
         sport_type = activity.get("sport_type", "")
-        is_trainer = activity.get("trainer", False)
-
-        # Only process outdoor (non-trainer) ride types
-        outdoor_ride_types = {"Ride", "GravelRide", "MountainBikeRide"}
-        if activity_type not in outdoor_ride_types and sport_type not in outdoor_ride_types:
-            log.info(
-                "Skipping activity %d — type=%s sport_type=%s",
-                activity_id, activity_type, sport_type,
-            )
+        outdoor_types = {"Ride", "GravelRide", "MountainBikeRide"}
+        if activity_type not in outdoor_types and sport_type not in outdoor_types:
+            log.info("Skipping activity %d — type=%s", activity_id, activity_type)
             return
-
-        if is_trainer:
+        if activity.get("trainer"):
             log.info("Skipping activity %d — trainer ride.", activity_id)
             return
 
         activity_name = activity.get("name", "Unnamed ride")
-        log.info("Processing outdoor ride: '%s' (ID %d)", activity_name, activity_id)
 
-        streams = strava_client.get_activity_streams(activity_id)
+        # If we don't have this user's weight, ask for it (once)
+        if user["weight_kg"] is None:
+            if not user["awaiting_weight"]:
+                sms_sender.send_weight_request(user["phone_number"])
+                db.set_awaiting_weight(athlete_id, True)
+                log.info("Asked %s for their weight.", user["phone_number"])
+            else:
+                log.info("Still waiting for weight from %s, skipping activity.", user["phone_number"])
+            return
 
-        mass_kg = float(os.getenv("RIDER_MASS_KG", "75.0"))
+        streams = strava_client.get_activity_streams(activity_id, access)
+
         crr = float(os.getenv("CRR", "0.004"))
         rho = float(os.getenv("RHO", "1.225"))
 
-        cda, n_samples = cda_calculator.calculate_cda(streams, mass_kg, crr, rho)
+        cda, n_samples = cda_calculator.calculate_cda(streams, user["weight_kg"], crr, rho)
         log.info("CdA for activity %d: %.4f m² (%d samples)", activity_id, cda, n_samples)
 
-        sms_sender.send_cda_sms(cda, n_samples, activity_name, activity_id)
+        sms_sender.send_cda_sms(user["phone_number"], cda, n_samples, activity_name, activity_id)
 
     except cda_calculator.NoPowerDataError:
-        log.warning("Activity %d has no power data — skipping CdA calculation.", activity_id)
+        log.warning("Activity %d has no power data — skipping.", activity_id)
     except cda_calculator.InsufficientDataError as e:
         log.warning("Activity %d — insufficient data: %s", activity_id, e)
     except Exception:
@@ -99,35 +115,117 @@ def _process_activity(activity_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# OAuth routes — visit /auth once in your browser to connect your Strava account
+# Inbound SMS — users reply with their weight or "change weight"
+# ---------------------------------------------------------------------------
+
+def _parse_weight(text: str) -> float | None:
+    """Parse a weight from SMS text. Accepts kg or lbs."""
+    match = re.search(r"(\d+\.?\d*)\s*(lbs?|kg)?", text.lower())
+    if not match:
+        return None
+    val = float(match.group(1))
+    unit = match.group(2) or "kg"
+    if "lb" in unit:
+        val = val * 0.453592
+    if val < 30 or val > 250:
+        return None
+    return round(val, 1)
+
+
+def _wants_to_change_weight(text: str) -> bool:
+    text = text.lower()
+    return any(phrase in text for phrase in ["change weight", "update weight", "new weight", "reset weight", "change my weight"])
+
+
+def _twiml(message: str):
+    resp = MessagingResponse()
+    resp.message(message)
+    return str(resp), 200, {"Content-Type": "text/xml"}
+
+
+@app.route("/sms/inbound", methods=["POST"])
+def sms_inbound():
+    from_number = request.form.get("From", "").strip()
+    body = request.form.get("Body", "").strip()
+    log.info("Inbound SMS from %s: %r", from_number, body)
+
+    user = db.get_user_by_phone(from_number)
+    if not user:
+        return _twiml("Sorry, I don't recognize this number. Connect your Strava account first.")
+
+    if _wants_to_change_weight(body):
+        db.set_awaiting_weight(user["athlete_id"], True)
+        return _twiml("Sure! What's your new combined rider + bike weight? Reply with a number in kg or lbs.")
+
+    if user["awaiting_weight"]:
+        weight = _parse_weight(body)
+        if weight is None:
+            sms_sender.send_weight_parse_error(from_number)
+            return _twiml("")  # already sent the error via send, return empty TwiML
+        db.set_weight(user["athlete_id"], weight)
+        return _twiml(f"Got it — {weight:.1f} kg stored! I'll use this for all your CdA calculations. "
+                      f"Reply 'change weight' any time to update it.")
+
+    return _twiml("Reply 'change weight' to update your stored weight.")
+
+
+# ---------------------------------------------------------------------------
+# OAuth — users visit /auth?phone=+1XXXXXXXXXX to connect their Strava account
 # ---------------------------------------------------------------------------
 
 @app.route("/auth")
 def auth():
+    phone = request.args.get("phone", "").strip()
+    if not phone:
+        return (
+            "<h2>Connect your Strava account</h2>"
+            "<p>Add your phone number to the URL: <code>/auth?phone=+1XXXXXXXXXX</code></p>"
+        ), 400
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-    redirect_uri = f"{public_url}/callback"
-    return redirect(strava_client.get_auth_url(redirect_uri))
+    state = base64.urlsafe_b64encode(json.dumps({"phone": phone}).encode()).decode()
+    return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
 
 
 @app.route("/callback")
 def oauth_callback():
     code = request.args.get("code")
+    state = request.args.get("state", "")
     error = request.args.get("error")
+
     if error or not code:
         return f"Authorization failed: {error or 'no code'}", 400
+
+    try:
+        state_data = json.loads(base64.urlsafe_b64decode(state + "=="))
+        phone = state_data.get("phone", "")
+    except Exception:
+        return "Invalid state parameter.", 400
+
+    if not phone:
+        return "Phone number missing from state.", 400
+
     try:
         tokens = strava_client.exchange_code(code)
         athlete = tokens.get("athlete", {})
-        name = athlete.get("firstname", "")
-        log.info("Authorized Strava account for %s %s", name, athlete.get("lastname", ""))
+        athlete_id = athlete["id"]
+        db.upsert_user(
+            athlete_id,
+            phone,
+            tokens["access_token"],
+            tokens["refresh_token"],
+            tokens["expires_at"],
+        )
+        name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+        log.info("Authorized athlete %d (%s) with phone %s", athlete_id, name, phone)
         return (
-            f"<h2>Authorized!</h2>"
-            f"<p>Connected as <strong>{name} {athlete.get('lastname','')}</strong>.</p>"
-            f"<p>You can close this tab. Strava activities will now trigger CdA texts.</p>"
+            f"<h2>You're connected!</h2>"
+            f"<p>Strava account: <strong>{name}</strong></p>"
+            f"<p>Phone: <strong>{phone}</strong></p>"
+            f"<p>Upload an outdoor ride and I'll text you your CdA. You can close this tab.</p>"
         ), 200
     except Exception as e:
         log.error("OAuth exchange failed: %s", e)
-        return f"OAuth exchange failed: {e}", 500
+        return f"OAuth failed: {e}", 500
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +234,9 @@ def oauth_callback():
 
 @app.route("/health")
 def health():
-    tokens = token_store.load_tokens()
-    authorized = tokens is not None
-    return jsonify({"status": "ok", "strava_authorized": authorized}), 200
+    with db._conn() as conn:
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return jsonify({"status": "ok", "users": user_count}), 200
 
 
 if __name__ == "__main__":
