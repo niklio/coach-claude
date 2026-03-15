@@ -136,10 +136,43 @@ def _wants_to_change_weight(text: str) -> bool:
     return any(phrase in text for phrase in ["change weight", "update weight", "new weight", "reset weight", "change my weight"])
 
 
+def _wants_last_cda(text: str) -> bool:
+    text = text.lower()
+    return any(phrase in text for phrase in ["last ride", "last cda", "my cda", "recent ride", "latest ride", "what was my", "what's my cda"])
+
+
 def _twiml(message: str):
     resp = MessagingResponse()
     resp.message(message)
     return str(resp), 200, {"Content-Type": "text/xml"}
+
+
+def _lookup_last_cda(user: dict) -> None:
+    try:
+        access, refresh, expires = strava_client.refresh_if_needed(
+            user["access_token"], user["refresh_token"], user["expires_at"]
+        )
+        if access != user["access_token"]:
+            db.update_tokens(user["athlete_id"], access, refresh, expires)
+
+        activity = strava_client.get_last_outdoor_ride(access)
+        if not activity:
+            sms_sender._send(user["phone_number"], "Couldn't find a recent outdoor ride on your Strava.")
+            return
+
+        streams = strava_client.get_activity_streams(activity["id"], access)
+        crr = float(os.getenv("CRR", "0.004"))
+        rho = float(os.getenv("RHO", "1.225"))
+        cda, n_samples = cda_calculator.calculate_cda(streams, user["weight_kg"], crr, rho)
+        sms_sender.send_cda_sms(user["phone_number"], cda, n_samples, activity["name"], activity["id"])
+
+    except cda_calculator.NoPowerDataError:
+        sms_sender._send(user["phone_number"], "Your last ride has no power data — can't calculate CdA.")
+    except cda_calculator.InsufficientDataError as e:
+        sms_sender._send(user["phone_number"], f"Not enough data to calculate CdA: {e}")
+    except Exception:
+        log.error("Error in _lookup_last_cda for athlete %d:\n%s", user["athlete_id"], traceback.format_exc())
+        sms_sender._send(user["phone_number"], "Something went wrong looking up your last ride. Try again.")
 
 
 @app.route("/sms/inbound", methods=["POST"])
@@ -158,6 +191,13 @@ def sms_inbound():
             f"To get started, connect your Strava account:\n{auth_url}"
         )
 
+    if _wants_last_cda(body):
+        if user["weight_kg"] is None:
+            return _twiml("I don't have your weight yet — reply with your combined rider + bike weight in kg or lbs first.")
+        t = threading.Thread(target=_lookup_last_cda, args=(user,), daemon=True)
+        t.start()
+        return _twiml("Looking up your last ride...")
+
     if _wants_to_change_weight(body):
         db.set_awaiting_weight(user["athlete_id"], True)
         return _twiml("Sure! What's your new combined rider + bike weight? Reply with a number in kg or lbs.")
@@ -171,7 +211,7 @@ def sms_inbound():
         return _twiml(f"Got it — {weight:.1f} kg stored! I'll use this for all your CdA calculations. "
                       f"Reply 'change weight' any time to update it.")
 
-    return _twiml("Reply 'change weight' to update your stored weight.")
+    return _twiml("Commands:\n• 'last ride' — get CdA from your most recent ride\n• 'change weight' — update your stored weight")
 
 
 # ---------------------------------------------------------------------------

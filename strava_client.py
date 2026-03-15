@@ -69,6 +69,26 @@ def get_activity(activity_id: int, access_token: str) -> dict:
     return resp.json()
 
 
+OUTDOOR_RIDE_TYPES = {"Ride", "GravelRide", "MountainBikeRide"}
+
+
+def get_last_outdoor_ride(access_token: str) -> dict | None:
+    """Return the most recent outdoor ride activity, or None if not found."""
+    resp = requests.get(
+        f"{STRAVA_API}/athlete/activities",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={"per_page": 10, "page": 1},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    for activity in resp.json():
+        if (activity.get("type") in OUTDOOR_RIDE_TYPES or
+                activity.get("sport_type") in OUTDOOR_RIDE_TYPES):
+            if not activity.get("trainer"):
+                return activity
+    return None
+
+
 def get_activity_streams(activity_id: int, access_token: str) -> dict:
     keys = "time,velocity_smooth,watts,altitude,grade_smooth"
     resp = requests.get(
