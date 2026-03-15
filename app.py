@@ -27,7 +27,6 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me")
 
-db.init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +239,7 @@ def oauth_callback():
 
 @app.route("/health")
 def health():
-    with db._conn() as conn:
-        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    return jsonify({"status": "ok", "users": user_count}), 200
+    return jsonify({"status": "ok", "users": db.user_count()}), 200
 
 
 if __name__ == "__main__":

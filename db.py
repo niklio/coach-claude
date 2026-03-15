@@ -1,86 +1,54 @@
-import os
-import sqlite3
-import threading
+import logging
+from google.cloud import firestore
 
-DB_PATH = os.getenv("DB_PATH", "strava_cda.db")
-_lock = threading.Lock()
+log = logging.getLogger(__name__)
 
-
-def _conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+_db = firestore.Client()
+_USERS = "users"
 
 
-def init_db():
-    with _lock:
-        with _conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    athlete_id      INTEGER PRIMARY KEY,
-                    phone_number    TEXT    NOT NULL,
-                    access_token    TEXT    NOT NULL,
-                    refresh_token   TEXT    NOT NULL,
-                    expires_at      INTEGER NOT NULL DEFAULT 0,
-                    weight_kg       REAL,
-                    awaiting_weight INTEGER NOT NULL DEFAULT 0
-                )
-            """)
-            conn.commit()
+def _ref(athlete_id: int):
+    return _db.collection(_USERS).document(str(athlete_id))
 
 
 def upsert_user(athlete_id: int, phone: str, access_token: str, refresh_token: str, expires_at: int) -> None:
-    with _lock:
-        with _conn() as conn:
-            conn.execute("""
-                INSERT INTO users (athlete_id, phone_number, access_token, refresh_token, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(athlete_id) DO UPDATE SET
-                    phone_number  = excluded.phone_number,
-                    access_token  = excluded.access_token,
-                    refresh_token = excluded.refresh_token,
-                    expires_at    = excluded.expires_at
-            """, (athlete_id, phone, access_token, refresh_token, expires_at))
-            conn.commit()
+    _ref(athlete_id).set(
+        {
+            "athlete_id": athlete_id,
+            "phone_number": phone,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+        },
+        merge=True,
+    )
 
 
 def get_user_by_athlete(athlete_id: int) -> dict | None:
-    with _conn() as conn:
-        row = conn.execute("SELECT * FROM users WHERE athlete_id = ?", (athlete_id,)).fetchone()
-        return dict(row) if row else None
+    doc = _ref(athlete_id).get()
+    return doc.to_dict() if doc.exists else None
 
 
 def get_user_by_phone(phone: str) -> dict | None:
-    with _conn() as conn:
-        row = conn.execute("SELECT * FROM users WHERE phone_number = ?", (phone,)).fetchone()
-        return dict(row) if row else None
+    docs = _db.collection(_USERS).where("phone_number", "==", phone).limit(1).stream()
+    for doc in docs:
+        return doc.to_dict()
+    return None
 
 
 def update_tokens(athlete_id: int, access_token: str, refresh_token: str, expires_at: int) -> None:
-    with _lock:
-        with _conn() as conn:
-            conn.execute(
-                "UPDATE users SET access_token=?, refresh_token=?, expires_at=? WHERE athlete_id=?",
-                (access_token, refresh_token, expires_at, athlete_id),
-            )
-            conn.commit()
+    _ref(athlete_id).update(
+        {"access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at}
+    )
 
 
 def set_weight(athlete_id: int, weight_kg: float) -> None:
-    with _lock:
-        with _conn() as conn:
-            conn.execute(
-                "UPDATE users SET weight_kg=?, awaiting_weight=0 WHERE athlete_id=?",
-                (weight_kg, athlete_id),
-            )
-            conn.commit()
+    _ref(athlete_id).update({"weight_kg": weight_kg, "awaiting_weight": False})
 
 
 def set_awaiting_weight(athlete_id: int, awaiting: bool) -> None:
-    with _lock:
-        with _conn() as conn:
-            conn.execute(
-                "UPDATE users SET awaiting_weight=? WHERE athlete_id=?",
-                (1 if awaiting else 0, athlete_id),
-            )
-            conn.commit()
+    _ref(athlete_id).update({"awaiting_weight": awaiting})
+
+
+def user_count() -> int:
+    return len(_db.collection(_USERS).list_documents())
