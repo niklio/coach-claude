@@ -51,4 +51,4 @@ def set_awaiting_weight(athlete_id: int, awaiting: bool) -> None:
 
 
 def user_count() -> int:
-    return len(_db.collection(_USERS).list_documents())
+    return sum(1 for _ in _db.collection(_USERS).list_documents())
