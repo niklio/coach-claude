@@ -155,8 +155,8 @@ def sms_inbound():
         encoded_phone = urllib.parse.quote(from_number)
         auth_url = f"{public_url}/auth?phone={encoded_phone}"
         return _twiml(
-            f"Welcome! To get started, connect your Strava account by visiting this link:\n{auth_url}\n\n"
-            f"Once connected, I'll text you your CdA after every outdoor ride."
+            f"Hey! This is Coach Claude — I text you your aerodynamic CdA after every outdoor ride.\n\n"
+            f"To get started, connect your Strava account:\n{auth_url}"
         )
 
     if _wants_to_change_weight(body):
@@ -184,7 +184,7 @@ def auth():
     phone = request.args.get("phone", "").strip()
     if not phone:
         return (
-            "<h2>Connect your Strava account</h2>"
+            "<h2>Coach Claude — Connect your Strava account</h2>"
             "<p>Add your phone number to the URL: <code>/auth?phone=+1XXXXXXXXXX</code></p>"
         ), 400
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
@@ -224,10 +224,10 @@ def oauth_callback():
         name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
         log.info("Authorized athlete %d (%s) with phone %s", athlete_id, name, phone)
         return (
-            f"<h2>You're connected!</h2>"
+            f"<h2>You're connected to Coach Claude!</h2>"
             f"<p>Strava account: <strong>{name}</strong></p>"
             f"<p>Phone: <strong>{phone}</strong></p>"
-            f"<p>Upload an outdoor ride and I'll text you your CdA. You can close this tab.</p>"
+            f"<p>Upload an outdoor ride and Coach Claude will text you your CdA. You can close this tab.</p>"
         ), 200
     except Exception as e:
         log.error("OAuth exchange failed: %s", e)

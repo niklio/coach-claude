@@ -22,7 +22,7 @@ def _send(to: str, body: str) -> None:
 def send_weight_request(to: str) -> None:
     _send(
         to,
-        "Hey! I'll text you your CdA after every outdoor Strava ride. "
+        "Hey, this is Coach Claude! I'll text you your CdA after every outdoor Strava ride. "
         "First, what's your combined rider + bike weight? "
         "Reply with a number in kg (e.g. 75) or lbs (e.g. 165 lbs).",
     )
@@ -31,6 +31,7 @@ def send_weight_request(to: str) -> None:
 def send_cda_sms(to: str, cda: float, n_samples: int, activity_name: str, activity_id: int) -> None:
     _send(
         to,
+        f"Coach Claude\n"
         f"Ride: \"{activity_name}\"\n"
         f"CdA: {cda:.4f} m²\n"
         f"({n_samples} samples)\n"
@@ -39,9 +40,9 @@ def send_cda_sms(to: str, cda: float, n_samples: int, activity_name: str, activi
 
 
 def send_weight_confirmed(to: str, weight_kg: float) -> None:
-    _send(to, f"Got it — {weight_kg:.1f} kg stored. I'll use this for all your CdA calculations. "
+    _send(to, f"Got it — {weight_kg:.1f} kg stored. Coach Claude will use this for all your CdA calculations. "
               f"Reply 'change weight' any time to update it.")
 
 
 def send_weight_parse_error(to: str) -> None:
-    _send(to, "Couldn't parse that. Please reply with just your weight, e.g. '75' or '165 lbs'.")
+    _send(to, "Coach Claude couldn't parse that. Please reply with just your weight, e.g. '75' or '165 lbs'.")
