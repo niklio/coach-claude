@@ -74,7 +74,14 @@
   <p class="tagline">
     <span class="dot"></span>Real-time cycling performance analytics, delivered to your phone.
   </p>
-  <a href="https://chat.irlll.com" class="try-btn">Try it</a>
+  <a id="try-btn" href="#" class="try-btn">Try it</a>
+  <script>
+    var host = location.hostname;
+    var chatUrl = (host === 'irlll.com' || host === 'www.irlll.com')
+      ? 'https://chat.irlll.com'
+      : 'https://coach-claude-twewb3xjxa-ue.a.run.app/chat';
+    document.getElementById('try-btn').href = chatUrl;
+  </script>
   <footer>&copy; 2026 Coach Claude &mdash; nikliolios@irlll.com</footer>
 </body>
 </html>
