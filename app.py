@@ -7,6 +7,7 @@ import threading
 import traceback
 import urllib.parse
 
+import anthropic
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request, session
 from twilio.twiml.messaging_response import MessagingResponse
@@ -669,6 +670,137 @@ def chat_status():
     })
 
 
+_CLAUDE_TOOLS = [
+    {
+        "name": "get_last_ride_cda",
+        "description": (
+            "Calculate the CdA (aerodynamic drag coefficient) for the user's most recent "
+            "outdoor Strava ride. Returns ride name, CdA in m², sample count, and a Strava link. "
+            "Requires the user to have a weight stored."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "set_weight",
+        "description": (
+            "Store the user's combined rider + bike weight in kg. "
+            "Use this whenever the user provides their weight."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "weight_kg": {
+                    "type": "number",
+                    "description": "Combined rider + bike weight in kilograms.",
+                }
+            },
+            "required": ["weight_kg"],
+        },
+    },
+    {
+        "name": "get_weight",
+        "description": "Retrieve the user's currently stored weight.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+_SYSTEM_PROMPT = """\
+You are Coach Claude, an AI cycling performance coach. You help cyclists understand and \
+improve their aerodynamics by calculating their CdA (coefficient of drag area) from Strava \
+ride data.
+
+CdA measures how aerodynamic a rider is — lower is better. Typical values:
+• 0.20–0.25 m² — aggressive TT/triathlon position
+• 0.28–0.35 m² — road bike, hoods or drops
+• 0.35–0.45 m² — upright position
+
+You have tools to look up rides and manage the user's weight profile. Be concise, \
+encouraging, and data-driven. When a user asks about their performance or recent ride, \
+use tools to fetch real data rather than asking clarifying questions first.
+
+If the user hasn't provided their weight yet, ask for it before attempting a CdA \
+calculation — it's required for the physics model.\
+"""
+
+_MAX_HISTORY = 20  # max messages to keep in session
+
+
+def _execute_claude_tool(name: str, tool_input: dict, user: dict) -> str:
+    if name == "get_last_ride_cda":
+        if user.get("weight_kg") is None:
+            return "Cannot calculate CdA: no weight stored. Ask the user for their combined rider + bike weight first."
+        return _lookup_last_cda_sync(user)
+
+    if name == "set_weight":
+        weight_kg = tool_input.get("weight_kg")
+        if not weight_kg or not (30 <= weight_kg <= 250):
+            return f"Invalid weight value: {weight_kg}. Must be between 30 and 250 kg."
+        weight_kg = round(weight_kg, 1)
+        db.set_weight(user["athlete_id"], weight_kg)
+        user["weight_kg"] = weight_kg  # update in-place for subsequent tool calls
+        return f"Weight stored: {weight_kg} kg."
+
+    if name == "get_weight":
+        w = user.get("weight_kg")
+        return f"Stored weight: {w} kg." if w else "No weight stored yet."
+
+    return f"Unknown tool: {name}"
+
+
+def _chat_with_claude(user: dict, text: str, history: list) -> tuple[str, list]:
+    """
+    Run one user turn through Claude with tool use.
+    Returns (reply_text, updated_history).
+    history is a list of {"role": "user"|"assistant", "content": str}.
+    """
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    # Build message list for this request
+    messages = list(history) + [{"role": "user", "content": text}]
+
+    while True:
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=1024,
+            system=_SYSTEM_PROMPT,
+            tools=_CLAUDE_TOOLS,
+            messages=messages,
+        ) as stream:
+            response = stream.get_final_message()
+
+        if response.stop_reason == "end_turn":
+            reply = next((b.text for b in response.content if b.type == "text"), "")
+            # Persist only text turns in history
+            new_history = (history + [
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": reply},
+            ])[-_MAX_HISTORY:]
+            return reply, new_history
+
+        if response.stop_reason == "tool_use":
+            # Append assistant turn (with tool_use blocks) to working messages
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Execute all tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result = _execute_claude_tool(block.name, block.input, user)
+                    log.info("Tool %s → %r", block.name, result[:120])
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # Unexpected stop reason
+            break
+
+    return "Something went wrong. Please try again.", history
+
+
 @app.route("/chat/message", methods=["POST"])
 def chat_message():
     athlete_id = session.get("athlete_id")
@@ -685,7 +817,15 @@ def chat_message():
         return jsonify({"reply": ""}), 400
 
     log.info("Chat message from athlete %d: %r", athlete_id, text)
-    reply = _process_message(user, text)
+
+    history = session.get("chat_history", [])
+    try:
+        reply, updated_history = _chat_with_claude(user, text, history)
+        session["chat_history"] = updated_history
+    except Exception:
+        log.error("Claude chat error for athlete %d:\n%s", athlete_id, traceback.format_exc())
+        reply = "Something went wrong — please try again."
+
     return jsonify({"reply": reply})
 
 

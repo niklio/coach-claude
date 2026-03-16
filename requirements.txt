@@ -5,3 +5,4 @@ numpy>=1.26
 twilio>=9.0
 python-dotenv>=1.0
 google-cloud-firestore>=2.19
+anthropic>=0.40
