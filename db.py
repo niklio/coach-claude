@@ -12,16 +12,22 @@ def _ref(athlete_id: int):
 
 
 def upsert_user(athlete_id: int, phone: str, access_token: str, refresh_token: str, expires_at: int) -> None:
-    _ref(athlete_id).set(
-        {
-            "athlete_id": athlete_id,
-            "phone_number": phone,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_at": expires_at,
-        },
-        merge=True,
-    )
+    doc = _ref(athlete_id)
+    existing = doc.get().to_dict() or {}
+    data = {
+        "athlete_id": athlete_id,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": expires_at,
+        # Only set defaults if not already present
+        "weight_kg": existing.get("weight_kg", None),
+        "awaiting_weight": existing.get("awaiting_weight", False),
+    }
+    if phone:
+        data["phone_number"] = phone
+    elif "phone_number" not in existing:
+        data["phone_number"] = ""
+    doc.set(data, merge=True)
 
 
 def get_user_by_athlete(athlete_id: int) -> dict | None:

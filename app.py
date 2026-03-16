@@ -8,7 +8,7 @@ import traceback
 import urllib.parse
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, jsonify, redirect, request, session
 from twilio.twiml.messaging_response import MessagingResponse
 
 import cda_calculator
@@ -27,6 +27,91 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me")
 
+
+
+# ---------------------------------------------------------------------------
+# Shared message processing logic
+# ---------------------------------------------------------------------------
+
+def _parse_weight(text: str) -> float | None:
+    """Parse a weight from SMS text. Accepts kg or lbs."""
+    match = re.search(r"(\d+\.?\d*)\s*(lbs?|kg)?", text.lower())
+    if not match:
+        return None
+    val = float(match.group(1))
+    unit = match.group(2) or "kg"
+    if "lb" in unit:
+        val = val * 0.453592
+    if val < 30 or val > 250:
+        return None
+    return round(val, 1)
+
+
+def _wants_to_change_weight(text: str) -> bool:
+    text = text.lower()
+    return any(phrase in text for phrase in ["change weight", "update weight", "new weight", "reset weight", "change my weight"])
+
+
+def _wants_last_cda(text: str) -> bool:
+    text = text.lower()
+    return any(phrase in text for phrase in ["last ride", "last cda", "my cda", "recent ride", "latest ride", "what was my", "what's my cda"])
+
+
+def _lookup_last_cda_sync(user: dict) -> str:
+    """Synchronously compute CdA for user's last outdoor ride. Returns a message string."""
+    try:
+        access, refresh, expires = strava_client.refresh_if_needed(
+            user["access_token"], user["refresh_token"], user["expires_at"]
+        )
+        if access != user["access_token"]:
+            db.update_tokens(user["athlete_id"], access, refresh, expires)
+
+        activity = strava_client.get_last_outdoor_ride(access)
+        if not activity:
+            return "Couldn't find a recent outdoor ride on your Strava."
+
+        streams = strava_client.get_activity_streams(activity["id"], access)
+        crr = float(os.getenv("CRR", "0.004"))
+        rho = float(os.getenv("RHO", "1.225"))
+        cda, n_samples = cda_calculator.calculate_cda(streams, user["weight_kg"], crr, rho)
+        return (
+            f"Ride: \"{activity['name']}\"\n"
+            f"CdA: {cda:.4f} m²\n"
+            f"({n_samples} samples)\n"
+            f"strava.com/activities/{activity['id']}"
+        )
+
+    except cda_calculator.NoPowerDataError:
+        return "Your last ride has no power data — can't calculate CdA."
+    except cda_calculator.InsufficientDataError as e:
+        return f"Not enough data to calculate CdA: {e}"
+    except Exception:
+        log.error("Error in _lookup_last_cda_sync for athlete %d:\n%s", user["athlete_id"], traceback.format_exc())
+        return "Something went wrong looking up your last ride. Try again."
+
+
+def _process_message(user: dict, text: str) -> str:
+    """Process an inbound message (SMS or chat) and return the reply text."""
+    if _wants_last_cda(text):
+        if user["weight_kg"] is None:
+            return "I don't have your weight yet — send me your combined rider + bike weight in kg or lbs first."
+        return _lookup_last_cda_sync(user)
+
+    if _wants_to_change_weight(text):
+        db.set_awaiting_weight(user["athlete_id"], True)
+        return "Sure! What's your new combined rider + bike weight? Reply with a number in kg or lbs."
+
+    if user["awaiting_weight"]:
+        weight = _parse_weight(text)
+        if weight is None:
+            return "Coach Claude couldn't parse that. Please reply with just your weight, e.g. '75' or '165 lbs'."
+        db.set_weight(user["athlete_id"], weight)
+        return (
+            f"Got it — {weight:.1f} kg stored! I'll use this for all your CdA calculations. "
+            f"Reply 'change weight' any time to update it."
+        )
+
+    return "Commands:\n• 'last ride' — get CdA from your most recent ride\n• 'change weight' — update your stored weight"
 
 
 # ---------------------------------------------------------------------------
@@ -114,32 +199,8 @@ def _process_activity(activity_id: int, athlete_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Inbound SMS — users reply with their weight or "change weight"
+# Inbound SMS
 # ---------------------------------------------------------------------------
-
-def _parse_weight(text: str) -> float | None:
-    """Parse a weight from SMS text. Accepts kg or lbs."""
-    match = re.search(r"(\d+\.?\d*)\s*(lbs?|kg)?", text.lower())
-    if not match:
-        return None
-    val = float(match.group(1))
-    unit = match.group(2) or "kg"
-    if "lb" in unit:
-        val = val * 0.453592
-    if val < 30 or val > 250:
-        return None
-    return round(val, 1)
-
-
-def _wants_to_change_weight(text: str) -> bool:
-    text = text.lower()
-    return any(phrase in text for phrase in ["change weight", "update weight", "new weight", "reset weight", "change my weight"])
-
-
-def _wants_last_cda(text: str) -> bool:
-    text = text.lower()
-    return any(phrase in text for phrase in ["last ride", "last cda", "my cda", "recent ride", "latest ride", "what was my", "what's my cda"])
-
 
 def _twiml(message: str):
     resp = MessagingResponse()
@@ -148,31 +209,8 @@ def _twiml(message: str):
 
 
 def _lookup_last_cda(user: dict) -> None:
-    try:
-        access, refresh, expires = strava_client.refresh_if_needed(
-            user["access_token"], user["refresh_token"], user["expires_at"]
-        )
-        if access != user["access_token"]:
-            db.update_tokens(user["athlete_id"], access, refresh, expires)
-
-        activity = strava_client.get_last_outdoor_ride(access)
-        if not activity:
-            sms_sender._send(user["phone_number"], "Couldn't find a recent outdoor ride on your Strava.")
-            return
-
-        streams = strava_client.get_activity_streams(activity["id"], access)
-        crr = float(os.getenv("CRR", "0.004"))
-        rho = float(os.getenv("RHO", "1.225"))
-        cda, n_samples = cda_calculator.calculate_cda(streams, user["weight_kg"], crr, rho)
-        sms_sender.send_cda_sms(user["phone_number"], cda, n_samples, activity["name"], activity["id"])
-
-    except cda_calculator.NoPowerDataError:
-        sms_sender._send(user["phone_number"], "Your last ride has no power data — can't calculate CdA.")
-    except cda_calculator.InsufficientDataError as e:
-        sms_sender._send(user["phone_number"], f"Not enough data to calculate CdA: {e}")
-    except Exception:
-        log.error("Error in _lookup_last_cda for athlete %d:\n%s", user["athlete_id"], traceback.format_exc())
-        sms_sender._send(user["phone_number"], "Something went wrong looking up your last ride. Try again.")
+    reply = _lookup_last_cda_sync(user)
+    sms_sender._send(user["phone_number"], reply)
 
 
 @app.route("/sms/inbound", methods=["POST"])
@@ -198,24 +236,12 @@ def sms_inbound():
         t.start()
         return _twiml("Looking up your last ride...")
 
-    if _wants_to_change_weight(body):
-        db.set_awaiting_weight(user["athlete_id"], True)
-        return _twiml("Sure! What's your new combined rider + bike weight? Reply with a number in kg or lbs.")
-
-    if user["awaiting_weight"]:
-        weight = _parse_weight(body)
-        if weight is None:
-            sms_sender.send_weight_parse_error(from_number)
-            return _twiml("")  # already sent the error via send, return empty TwiML
-        db.set_weight(user["athlete_id"], weight)
-        return _twiml(f"Got it — {weight:.1f} kg stored! I'll use this for all your CdA calculations. "
-                      f"Reply 'change weight' any time to update it.")
-
-    return _twiml("Commands:\n• 'last ride' — get CdA from your most recent ride\n• 'change weight' — update your stored weight")
+    reply = _process_message(user, body)
+    return _twiml(reply)
 
 
 # ---------------------------------------------------------------------------
-# OAuth — users visit /auth?phone=+1XXXXXXXXXX to connect their Strava account
+# OAuth — SMS flow: /auth?phone=+1XXXXXXXXXX
 # ---------------------------------------------------------------------------
 
 @app.route("/auth")
@@ -227,7 +253,7 @@ def auth():
             "<p>Add your phone number to the URL: <code>/auth?phone=+1XXXXXXXXXX</code></p>"
         ), 400
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-    state = base64.urlsafe_b64encode(json.dumps({"phone": phone}).encode()).decode()
+    state = base64.urlsafe_b64encode(json.dumps({"phone": phone, "source": "sms"}).encode()).decode()
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
 
 
@@ -243,11 +269,9 @@ def oauth_callback():
     try:
         state_data = json.loads(base64.urlsafe_b64decode(state + "=="))
         phone = state_data.get("phone", "")
+        source = state_data.get("source", "sms")
     except Exception:
         return "Invalid state parameter.", 400
-
-    if not phone:
-        return "Phone number missing from state.", 400
 
     try:
         tokens = strava_client.exchange_code(code)
@@ -261,7 +285,14 @@ def oauth_callback():
             tokens["expires_at"],
         )
         name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
-        log.info("Authorized athlete %d (%s) with phone %s", athlete_id, name, phone)
+        log.info("Authorized athlete %d (%s) with phone %s via %s", athlete_id, name, phone, source)
+
+        if source == "chat":
+            session["athlete_id"] = athlete_id
+            session["athlete_name"] = name
+            public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+            return redirect(f"{public_url}/chat")
+
         return (
             f"<h2>You're connected to Coach Claude!</h2>"
             f"<p>Strava account: <strong>{name}</strong></p>"
@@ -271,6 +302,306 @@ def oauth_callback():
     except Exception as e:
         log.error("OAuth exchange failed: %s", e)
         return f"OAuth failed: {e}", 500
+
+
+# ---------------------------------------------------------------------------
+# Chat interface — chat.irlll.com served from /chat*
+# ---------------------------------------------------------------------------
+
+CHAT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude — Chat</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a;
+      color: #f0f0f0;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1e1e1e;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    header .logo { font-weight: 800; font-size: 1.1rem; color: #fff; }
+
+    header .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #4ade80; flex-shrink: 0;
+    }
+
+    #auth-screen {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      padding: 2rem;
+      text-align: center;
+    }
+
+    #auth-screen h2 { font-size: 1.4rem; font-weight: 700; }
+    #auth-screen p { color: #888; max-width: 340px; line-height: 1.6; }
+
+    .strava-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: #fc4c02;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: opacity 0.15s;
+    }
+    .strava-btn:hover { opacity: 0.85; }
+
+    #chat-screen {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      display: none;
+    }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .msg {
+      max-width: 75%;
+      padding: 0.65rem 1rem;
+      border-radius: 16px;
+      font-size: 0.95rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .msg.user {
+      align-self: flex-end;
+      background: #1d4ed8;
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+
+    .msg.coach {
+      align-self: flex-start;
+      background: #1e1e1e;
+      color: #f0f0f0;
+      border-bottom-left-radius: 4px;
+    }
+
+    .msg.typing {
+      align-self: flex-start;
+      background: #1e1e1e;
+      color: #666;
+      font-style: italic;
+      border-bottom-left-radius: 4px;
+    }
+
+    #input-row {
+      display: flex;
+      gap: 0.5rem;
+      padding: 1rem 1.5rem;
+      border-top: 1px solid #1e1e1e;
+    }
+
+    #msg-input {
+      flex: 1;
+      background: #1e1e1e;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      color: #f0f0f0;
+      font-size: 0.95rem;
+      padding: 0.65rem 1rem;
+      outline: none;
+      resize: none;
+      height: 42px;
+      max-height: 120px;
+      overflow-y: auto;
+      font-family: inherit;
+    }
+    #msg-input:focus { border-color: #4ade80; }
+    #msg-input::placeholder { color: #555; }
+
+    #send-btn {
+      background: #4ade80;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.9rem;
+      padding: 0 1.1rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      flex-shrink: 0;
+    }
+    #send-btn:hover { opacity: 0.85; }
+    #send-btn:disabled { opacity: 0.4; cursor: default; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dot"></div>
+    <div class="logo">Coach Claude</div>
+  </header>
+
+  <div id="auth-screen">
+    <h2>Connect your Strava</h2>
+    <p>Coach Claude analyses your outdoor rides and reports your aerodynamic CdA. Connect Strava to get started.</p>
+    <a id="strava-link" href="/chat/auth" class="strava-btn">
+      Connect with Strava
+    </a>
+  </div>
+
+  <div id="chat-screen">
+    <div id="messages"></div>
+    <div id="input-row">
+      <textarea id="msg-input" placeholder="Message Coach Claude…" rows="1"></textarea>
+      <button id="send-btn">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const authScreen = document.getElementById('auth-screen');
+    const chatScreen = document.getElementById('chat-screen');
+    const messages  = document.getElementById('messages');
+    const input     = document.getElementById('msg-input');
+    const sendBtn   = document.getElementById('send-btn');
+
+    function addMsg(text, role) {
+      const div = document.createElement('div');
+      div.className = 'msg ' + role;
+      div.textContent = text;
+      messages.appendChild(div);
+      messages.scrollTop = messages.scrollHeight;
+      return div;
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      input.style.height = '42px';
+      sendBtn.disabled = true;
+
+      addMsg(text, 'user');
+      const typing = addMsg('Thinking…', 'typing');
+
+      try {
+        const resp = await fetch('/chat/message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        const data = await resp.json();
+        typing.remove();
+        addMsg(data.reply, 'coach');
+      } catch (e) {
+        typing.remove();
+        addMsg('Something went wrong. Try again.', 'coach');
+      }
+
+      sendBtn.disabled = false;
+      input.focus();
+    }
+
+    sendBtn.addEventListener('click', send);
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+    input.addEventListener('input', () => {
+      input.style.height = '42px';
+      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    });
+
+    // Check auth status
+    fetch('/chat/status')
+      .then(r => r.json())
+      .then(data => {
+        if (data.authenticated) {
+          authScreen.style.display = 'none';
+          chatScreen.style.display = 'flex';
+          addMsg(
+            'Hey ' + data.name.split(' ')[0] + '! I\'m Coach Claude. Try:\\n• "last ride" — get CdA from your most recent ride\\n• "change weight" — update your stored weight',
+            'coach'
+          );
+          input.focus();
+        }
+      });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/chat")
+def chat_ui():
+    return CHAT_HTML, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/chat/auth")
+def chat_auth():
+    public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+    state = base64.urlsafe_b64encode(json.dumps({"phone": "", "source": "chat"}).encode()).decode()
+    return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
+
+
+@app.route("/chat/status")
+def chat_status():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"authenticated": False})
+    user = db.get_user_by_athlete(athlete_id)
+    if not user:
+        return jsonify({"authenticated": False})
+    return jsonify({"authenticated": True, "name": session.get("athlete_name", "")})
+
+
+@app.route("/chat/message", methods=["POST"])
+def chat_message():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"reply": "Session expired — please reconnect your Strava account."}), 401
+
+    user = db.get_user_by_athlete(athlete_id)
+    if not user:
+        return jsonify({"reply": "User not found — please reconnect your Strava account."}), 401
+
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"reply": ""}), 400
+
+    log.info("Chat message from athlete %d: %r", athlete_id, text)
+
+    if _wants_last_cda(text):
+        if user["weight_kg"] is None:
+            return jsonify({"reply": "I don't have your weight yet — send me your combined rider + bike weight in kg or lbs first."})
+        reply = _lookup_last_cda_sync(user)
+        return jsonify({"reply": reply})
+
+    reply = _process_message(user, text)
+    return jsonify({"reply": reply})
 
 
 # ---------------------------------------------------------------------------
