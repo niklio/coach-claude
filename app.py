@@ -333,31 +333,72 @@ CHAT_HTML = """<!DOCTYPE html>
       align-items: center;
       gap: 0.75rem;
     }
-
     header .logo { font-weight: 800; font-size: 1.1rem; color: #fff; }
-
     header .dot {
       width: 8px; height: 8px; border-radius: 50%;
       background: #4ade80; flex-shrink: 0;
     }
 
-    #auth-screen {
+    /* --- signup screens --- */
+    .signup-screen {
       flex: 1;
-      display: flex;
+      display: none;
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 1.5rem;
+      gap: 1.25rem;
       padding: 2rem;
       text-align: center;
     }
+    .signup-screen.active { display: flex; }
+    .signup-screen h2 { font-size: 1.4rem; font-weight: 700; }
+    .signup-screen p { color: #888; max-width: 340px; line-height: 1.6; }
 
-    #auth-screen h2 { font-size: 1.4rem; font-weight: 700; }
-    #auth-screen p { color: #888; max-width: 340px; line-height: 1.6; }
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      width: 100%;
+      max-width: 300px;
+    }
+    .field-group label { font-size: 0.85rem; color: #888; text-align: left; }
+
+    .text-input {
+      background: #1e1e1e;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      color: #f0f0f0;
+      font-size: 1rem;
+      padding: 0.7rem 1rem;
+      outline: none;
+      width: 100%;
+      font-family: inherit;
+    }
+    .text-input:focus { border-color: #4ade80; }
+    .text-input::placeholder { color: #555; }
+
+    .error-msg { font-size: 0.82rem; color: #f87171; min-height: 1em; }
+
+    .primary-btn {
+      background: #4ade80;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      padding: 0.75rem 2rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      width: 100%;
+      max-width: 300px;
+    }
+    .primary-btn:hover { opacity: 0.85; }
+    .primary-btn:disabled { opacity: 0.4; cursor: default; }
 
     .strava-btn {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 0.5rem;
       background: #fc4c02;
       color: #fff;
@@ -367,14 +408,16 @@ CHAT_HTML = """<!DOCTYPE html>
       border-radius: 8px;
       text-decoration: none;
       transition: opacity 0.15s;
+      width: 100%;
+      max-width: 300px;
     }
     .strava-btn:hover { opacity: 0.85; }
 
+    /* --- chat --- */
     #chat-screen {
       flex: 1;
-      display: flex;
-      flex-direction: column;
       display: none;
+      flex-direction: column;
     }
 
     #messages {
@@ -395,21 +438,18 @@ CHAT_HTML = """<!DOCTYPE html>
       white-space: pre-wrap;
       word-break: break-word;
     }
-
     .msg.user {
       align-self: flex-end;
       background: #1d4ed8;
       color: #fff;
       border-bottom-right-radius: 4px;
     }
-
     .msg.coach {
       align-self: flex-start;
       background: #1e1e1e;
       color: #f0f0f0;
       border-bottom-left-radius: 4px;
     }
-
     .msg.typing {
       align-self: flex-start;
       background: #1e1e1e;
@@ -424,7 +464,6 @@ CHAT_HTML = """<!DOCTYPE html>
       padding: 1rem 1.5rem;
       border-top: 1px solid #1e1e1e;
     }
-
     #msg-input {
       flex: 1;
       background: #1e1e1e;
@@ -442,7 +481,6 @@ CHAT_HTML = """<!DOCTYPE html>
     }
     #msg-input:focus { border-color: #4ade80; }
     #msg-input::placeholder { color: #555; }
-
     #send-btn {
       background: #4ade80;
       color: #0a0a0a;
@@ -465,14 +503,26 @@ CHAT_HTML = """<!DOCTYPE html>
     <div class="logo">Coach Claude</div>
   </header>
 
-  <div id="auth-screen">
-    <h2>Connect your Strava</h2>
-    <p>Coach Claude analyses your outdoor rides and reports your aerodynamic CdA. Connect Strava to get started.</p>
-    <a id="strava-link" href="/chat/auth" class="strava-btn">
-      Connect with Strava
-    </a>
+  <!-- Step 1: phone number -->
+  <div id="phone-screen" class="signup-screen active">
+    <h2>Get started</h2>
+    <p>Coach Claude analyses your outdoor rides and texts you your aerodynamic CdA. Enter your phone number to create your account.</p>
+    <div class="field-group">
+      <label for="phone-input">Phone number</label>
+      <input id="phone-input" class="text-input" type="tel" placeholder="+1 555 000 0000" autocomplete="tel" />
+      <div id="phone-error" class="error-msg"></div>
+    </div>
+    <button id="phone-next-btn" class="primary-btn">Continue</button>
   </div>
 
+  <!-- Step 2: connect Strava -->
+  <div id="strava-screen" class="signup-screen">
+    <h2>Connect Strava</h2>
+    <p>Almost there. Connect your Strava account so Coach Claude can analyse your rides.</p>
+    <a id="strava-link" href="#" class="strava-btn">Connect with Strava</a>
+  </div>
+
+  <!-- Chat -->
   <div id="chat-screen">
     <div id="messages"></div>
     <div id="input-row">
@@ -482,12 +532,41 @@ CHAT_HTML = """<!DOCTYPE html>
   </div>
 
   <script>
-    const authScreen = document.getElementById('auth-screen');
-    const chatScreen = document.getElementById('chat-screen');
-    const messages  = document.getElementById('messages');
-    const input     = document.getElementById('msg-input');
-    const sendBtn   = document.getElementById('send-btn');
+    const phoneScreen  = document.getElementById('phone-screen');
+    const stravaScreen = document.getElementById('strava-screen');
+    const chatScreen   = document.getElementById('chat-screen');
+    const messages     = document.getElementById('messages');
+    const input        = document.getElementById('msg-input');
+    const sendBtn      = document.getElementById('send-btn');
 
+    // ---- phone step ----
+    function normalizePhone(raw) {
+      const digits = raw.replace(/\D/g, '');
+      if (digits.length === 10) return '+1' + digits;
+      if (digits.length === 11 && digits[0] === '1') return '+' + digits;
+      if (digits.length > 7) return '+' + digits;
+      return null;
+    }
+
+    document.getElementById('phone-next-btn').addEventListener('click', () => {
+      const raw = document.getElementById('phone-input').value.trim();
+      const phone = normalizePhone(raw);
+      const err = document.getElementById('phone-error');
+      if (!phone) {
+        err.textContent = 'Please enter a valid phone number.';
+        return;
+      }
+      err.textContent = '';
+      document.getElementById('strava-link').href = '/chat/auth?phone=' + encodeURIComponent(phone);
+      phoneScreen.classList.remove('active');
+      stravaScreen.classList.add('active');
+    });
+
+    document.getElementById('phone-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('phone-next-btn').click();
+    });
+
+    // ---- chat ----
     function addMsg(text, role) {
       const div = document.createElement('div');
       div.className = 'msg ' + role;
@@ -534,17 +613,25 @@ CHAT_HTML = """<!DOCTYPE html>
       input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     });
 
-    // Check auth status
+    // ---- check existing session ----
     fetch('/chat/status')
       .then(r => r.json())
       .then(data => {
         if (data.authenticated) {
-          authScreen.style.display = 'none';
+          phoneScreen.classList.remove('active');
           chatScreen.style.display = 'flex';
-          addMsg(
-            'Hey ' + data.name.split(' ')[0] + '! I\'m Coach Claude. Try:\\n• "last ride" — get CdA from your most recent ride\\n• "change weight" — update your stored weight',
-            'coach'
-          );
+          const firstName = (data.name || '').split(' ')[0] || 'there';
+          if (data.needs_weight) {
+            addMsg(
+              'Hey ' + firstName + '! I\\'m Coach Claude.\\n\\nWhat\\'s your combined rider + bike weight? Reply with a number in kg or lbs (e.g. 75 or 165 lbs).',
+              'coach'
+            );
+          } else {
+            addMsg(
+              'Hey ' + firstName + '! I\\'m Coach Claude.\\n\\n• "last ride" — get CdA from your most recent ride\\n• "change weight" — update your stored weight',
+              'coach'
+            );
+          }
           input.focus();
         }
       });
@@ -561,8 +648,9 @@ def chat_ui():
 
 @app.route("/chat/auth")
 def chat_auth():
+    phone = request.args.get("phone", "").strip()
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-    state = base64.urlsafe_b64encode(json.dumps({"phone": "", "source": "chat"}).encode()).decode()
+    state = base64.urlsafe_b64encode(json.dumps({"phone": phone, "source": "chat"}).encode()).decode()
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
 
 
@@ -574,7 +662,11 @@ def chat_status():
     user = db.get_user_by_athlete(athlete_id)
     if not user:
         return jsonify({"authenticated": False})
-    return jsonify({"authenticated": True, "name": session.get("athlete_name", "")})
+    return jsonify({
+        "authenticated": True,
+        "name": session.get("athlete_name", ""),
+        "needs_weight": user.get("weight_kg") is None,
+    })
 
 
 @app.route("/chat/message", methods=["POST"])
@@ -593,13 +685,6 @@ def chat_message():
         return jsonify({"reply": ""}), 400
 
     log.info("Chat message from athlete %d: %r", athlete_id, text)
-
-    if _wants_last_cda(text):
-        if user["weight_kg"] is None:
-            return jsonify({"reply": "I don't have your weight yet — send me your combined rider + bike weight in kg or lbs first."})
-        reply = _lookup_last_cda_sync(user)
-        return jsonify({"reply": reply})
-
     reply = _process_message(user, text)
     return jsonify({"reply": reply})
 
