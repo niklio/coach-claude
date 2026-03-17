@@ -784,27 +784,32 @@ CHAT_HTML = """<!DOCTYPE html>
       input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     });
 
-    // ---- check existing session ----
+    // ---- check existing session, then fetch personalised greeting ----
     fetch('/chat/status')
       .then(r => r.json())
       .then(data => {
-        if (data.authenticated) {
-          phoneScreen.classList.remove('active');
-          chatScreen.style.display = 'flex';
-          const firstName = (data.name || '').split(' ')[0] || 'there';
-          if (data.needs_weight) {
-            addMsg(
-              'Hey ' + firstName + '! I\\'m Coach Claude.\\n\\nWhat\\'s your combined rider + bike weight? Reply with a number in kg or lbs (e.g. 75 or 165 lbs).',
-              'coach'
-            );
-          } else {
-            addMsg(
-              'Hey ' + firstName + '! I\\'m Coach Claude.\\n\\n• "last ride" — get CdA from your most recent ride\\n• "change weight" — update your stored weight',
-              'coach'
-            );
-          }
-          input.focus();
-        }
+        if (!data.authenticated) return;
+        phoneScreen.classList.remove('active');
+        chatScreen.style.display = 'flex';
+        sendBtn.disabled = true;
+        input.disabled = true;
+        const loadingMsg = addMsg('Coach Claude is reviewing your data\u2026', 'typing');
+        fetch('/chat/init')
+          .then(r => r.json())
+          .then(initData => {
+            loadingMsg.remove();
+            addMsg(initData.greeting || 'Hey! I\\'m Coach Claude. How can I help?', 'coach');
+            sendBtn.disabled = false;
+            input.disabled = false;
+            input.focus();
+          })
+          .catch(() => {
+            loadingMsg.remove();
+            addMsg('Hey! I\\'m Coach Claude. How can I help?', 'coach');
+            sendBtn.disabled = false;
+            input.disabled = false;
+            input.focus();
+          });
       });
   </script>
 </body>
@@ -1071,11 +1076,50 @@ def chat_status():
 
 _CLAUDE_TOOLS = [
     {
-        "name": "get_last_ride_cda",
+        "name": "calculate_cda",
         "description": (
-            "Calculate the CdA (aerodynamic drag coefficient) for the user's most recent "
-            "outdoor Strava ride. Returns ride name, CdA in m², sample count, and a Strava link. "
-            "Requires the user to have a weight stored."
+            "Calculate the CdA (aerodynamic drag coefficient) for a specific Strava ride or "
+            "the user's most recent outdoor ride if no activity_id is given. Returns ride name, "
+            "date, CdA in m², sample count, Strava URL, and a brief interpretation benchmarked "
+            "against typical values. Requires the user to have a weight stored."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "activity_id": {
+                    "type": "integer",
+                    "description": (
+                        "Strava activity ID to analyse. Omit to use the most recent outdoor ride."
+                    ),
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_recent_rides",
+        "description": (
+            "Fetch the user's recent outdoor rides from Strava. Returns name, date, distance "
+            "(km), total elevation gain (m), and average power (watts, if available) for each "
+            "ride. Use this to understand training load and to pick specific rides to analyse."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of rides to return. Default 5, max 20.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_athlete_profile",
+        "description": (
+            "Fetch the user's profile: full name, stored rider+bike weight, Strava FTP if set, "
+            "location, and any connected integrations (Garmin, TrainingPeaks). Use this to "
+            "personalise coaching responses and to check whether weight is set."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -1083,84 +1127,410 @@ _CLAUDE_TOOLS = [
         "name": "set_weight",
         "description": (
             "Store the user's combined rider + bike weight in kg. "
-            "Use this whenever the user provides their weight."
+            "Call this whenever the user provides or updates their weight."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "weight_kg": {
                     "type": "number",
-                    "description": "Combined rider + bike weight in kilograms.",
+                    "description": "Combined rider + bike weight in kilograms (30–250 kg).",
                 }
             },
             "required": ["weight_kg"],
         },
     },
     {
-        "name": "get_weight",
-        "description": "Retrieve the user's currently stored weight.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "name": "get_cda_history",
+        "description": (
+            "Fetch the last N outdoor rides and calculate CdA for each one. Returns a formatted "
+            "table with date, CdA value, and sample count per ride, plus a trend summary. Rides "
+            "without power data or insufficient samples are skipped and counted separately. Use "
+            "this to identify aerodynamic trends and give coaching insights."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of rides to analyse. Default 5.",
+                }
+            },
+            "required": [],
+        },
     },
 ]
 
 _SYSTEM_PROMPT = """\
-You are Coach Claude, an AI cycling performance coach. You help cyclists understand and \
-improve their aerodynamics by calculating their CdA (coefficient of drag area) from Strava \
-ride data.
+You are Coach Claude, an expert AI cycling performance coach with deep knowledge of \
+aerodynamics, training physiology, and power-based training. You help cyclists understand \
+and improve their performance by analysing their Strava ride data.
 
-CdA measures how aerodynamic a rider is — lower is better. Typical values:
-• 0.20–0.25 m² — aggressive TT/triathlon position
-• 0.28–0.35 m² — road bike, hoods or drops
-• 0.35–0.45 m² — upright position
+## Your expertise
 
-You have tools to look up rides and manage the user's weight profile. Be concise, \
-encouraging, and data-driven. When a user asks about their performance or recent ride, \
-use tools to fetch real data rather than asking clarifying questions first.
+**Aerodynamics & CdA**
+CdA (coefficient of drag area, m²) quantifies aerodynamic drag — it is the product of \
+drag coefficient (Cd) and frontal area (A). Lower CdA = less drag = faster at the same power.
 
-If the user hasn't provided their weight yet, ask for it before attempting a CdA \
-calculation — it's required for the physics model.\
+Typical CdA values by position:
+• 0.20–0.25 m² — aggressive TT / triathlon position (full tuck, aero helmet, skinsuit)
+• 0.25–0.28 m² — road race aero position (drops, tight kit, elbows in)
+• 0.28–0.32 m² — road bike in the drops, relaxed
+• 0.32–0.38 m² — road bike on the hoods
+• 0.38–0.50 m² — upright / commuter position
+
+A 0.01 m² CdA reduction saves ~6–8 watts at 40 km/h — meaningful in any race or time trial.
+
+**Power-based training zones** (based on FTP)
+• Zone 1 Recovery: <55% FTP
+• Zone 2 Endurance: 56–75% FTP
+• Zone 3 Tempo: 76–90% FTP
+• Zone 4 Threshold: 91–105% FTP
+• Zone 5 VO2max: 106–120% FTP
+• Zone 6 Anaerobic: >121% FTP
+
+**Key improvement levers**
+1. Position changes — lower torso, narrower arms, aero helmet (highest impact)
+2. Equipment — aero wheels, skinsuit, aero frame
+3. Consistency — CdA varies ride to ride; track trends, not isolated measurements
+4. Combined weight — lighter system reduces rolling resistance and gravity penalty
+
+## How you operate
+
+- When a user asks about performance, recent rides, CdA, or training — use your tools \
+immediately. Do not ask unnecessary clarifying questions before fetching data.
+- Give actionable, specific advice. Avoid generic platitudes like "ride more" or "train hard".
+- Benchmark every CdA result against the typical ranges above. Tell the user what their \
+number means in plain English.
+- When you have multiple rides, spot trends. Is CdA improving? Are there outlier sessions?
+- CdA from Strava streams has ~5% uncertainty, so differences <0.005 m² between rides are \
+within noise. Focus on trends over 5+ rides.
+- High CdA on a climb-heavy ride can reflect sitting up on steep grades — note this.
+- If the user has no weight stored, ask politely and explain it is required for the physics \
+model. Do not attempt CdA calculations without it.
+- When the conversation starts, proactively fetch the athlete profile and recent rides to \
+introduce yourself with personalised context.
+- Be encouraging but honest. If CdA is high, say so plainly and explain what would help.\
 """
 
 _MAX_HISTORY = 20  # max messages to keep in session
 
 
-def _execute_claude_tool(name: str, tool_input: dict, user: dict) -> str:
-    if name == "get_last_ride_cda":
-        if user.get("weight_kg") is None:
-            return "Cannot calculate CdA: no weight stored. Ask the user for their combined rider + bike weight first."
-        return _lookup_last_cda_sync(user)
+# ---------------------------------------------------------------------------
+# Strava helper — paginated recent outdoor rides
+# ---------------------------------------------------------------------------
 
+def _get_recent_outdoor_rides(access_token: str, limit: int = 20) -> list:
+    """Fetch up to `limit` recent outdoor ride activities from Strava."""
+    import requests as _requests
+    fetched = []
+    page = 1
+    while len(fetched) < limit:
+        resp = _requests.get(
+            f"{strava_client.STRAVA_API}/athlete/activities",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"per_page": min(30, limit * 2), "page": page},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        for activity in batch:
+            if len(fetched) >= limit:
+                break
+            is_outdoor_ride = (
+                activity.get("type") in strava_client.OUTDOOR_RIDE_TYPES or
+                activity.get("sport_type") in strava_client.OUTDOOR_RIDE_TYPES
+            )
+            if is_outdoor_ride and not activity.get("trainer"):
+                fetched.append(activity)
+        page += 1
+        if len(batch) < 30:
+            break
+    return fetched
+
+
+def _interpret_cda(cda: float) -> str:
+    """Return a plain-English benchmark for a given CdA value."""
+    if cda < 0.25:
+        return "Excellent — aggressive TT/triathlon position range (0.20–0.25 m²)"
+    if cda < 0.28:
+        return "Very good — aero road position range (0.25–0.28 m²)"
+    if cda < 0.32:
+        return "Good — road bike drops range (0.28–0.32 m²)"
+    if cda < 0.38:
+        return "Typical — road bike hoods range (0.32–0.38 m²)"
+    return "High — upright position (>0.38 m²); meaningful gains possible with position work"
+
+
+def _refresh_user_tokens(user: dict) -> dict:
+    """Refresh Strava tokens if needed, persist if changed, return updated user dict."""
+    access, refresh, expires = strava_client.refresh_if_needed(
+        user["access_token"], user["refresh_token"], user["expires_at"]
+    )
+    if access != user["access_token"]:
+        db.update_tokens(user["athlete_id"], access, refresh, expires)
+        user = dict(user, access_token=access, refresh_token=refresh, expires_at=expires)
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Tool execution dispatcher
+# ---------------------------------------------------------------------------
+
+def _execute_claude_tool(name: str, tool_input: dict, user: dict) -> str:
+    import datetime
+    crr = float(os.getenv("CRR", "0.004"))
+    rho = float(os.getenv("RHO", "1.225"))
+
+    # ------------------------------------------------------------------ #
+    #  calculate_cda                                                        #
+    # ------------------------------------------------------------------ #
+    if name == "calculate_cda":
+        if user.get("weight_kg") is None:
+            return (
+                "Cannot calculate CdA: no weight stored. "
+                "Ask the user for their combined rider + bike weight in kg first."
+            )
+        try:
+            user = _refresh_user_tokens(user)
+            access = user["access_token"]
+
+            activity_id = tool_input.get("activity_id")
+            if activity_id:
+                activity = strava_client.get_activity(int(activity_id), access)
+            else:
+                activity = strava_client.get_last_outdoor_ride(access)
+                if not activity:
+                    return "No recent outdoor rides found on your Strava account."
+
+            streams = strava_client.get_activity_streams(activity["id"], access)
+            cda, n_samples = cda_calculator.calculate_cda(streams, user["weight_kg"], crr, rho)
+
+            start_raw = activity.get("start_date_local", activity.get("start_date", ""))
+            try:
+                ride_date = datetime.datetime.fromisoformat(
+                    start_raw.replace("Z", "+00:00")
+                ).strftime("%d %b %Y")
+            except Exception:
+                ride_date = start_raw[:10] if start_raw else "unknown date"
+
+            return (
+                f"Ride: \"{activity['name']}\"\n"
+                f"Date: {ride_date}\n"
+                f"CdA: {cda:.4f} m²\n"
+                f"Samples: {n_samples}\n"
+                f"URL: https://www.strava.com/activities/{activity['id']}\n"
+                f"Interpretation: {_interpret_cda(cda)}"
+            )
+        except cda_calculator.NoPowerDataError:
+            return "This ride has no power meter data — CdA cannot be calculated without power."
+        except cda_calculator.InsufficientDataError as e:
+            return f"Insufficient data to calculate CdA: {e}"
+        except Exception:
+            log.error("calculate_cda tool error:\n%s", traceback.format_exc())
+            return "Error calculating CdA. The ride may be missing required data streams."
+
+    # ------------------------------------------------------------------ #
+    #  get_recent_rides                                                     #
+    # ------------------------------------------------------------------ #
+    if name == "get_recent_rides":
+        limit = min(int(tool_input.get("limit", 5)), 20)
+        try:
+            user = _refresh_user_tokens(user)
+            rides = _get_recent_outdoor_rides(user["access_token"], limit=limit)
+            if not rides:
+                return "No recent outdoor rides found on your Strava account."
+
+            lines = [f"Last {len(rides)} outdoor ride(s):\n"]
+            for i, r in enumerate(rides, 1):
+                start_raw = r.get("start_date_local", r.get("start_date", ""))
+                try:
+                    ride_date = datetime.datetime.fromisoformat(
+                        start_raw.replace("Z", "+00:00")
+                    ).strftime("%d %b %Y")
+                except Exception:
+                    ride_date = start_raw[:10] if start_raw else "?"
+
+                dist_km = round(r.get("distance", 0) / 1000, 1)
+                elev_m = round(r.get("total_elevation_gain", 0))
+                avg_power = r.get("average_watts")
+                power_str = f", {avg_power:.0f}W avg" if avg_power else ""
+                lines.append(
+                    f"{i}. {r['name']} — {ride_date}, {dist_km} km, "
+                    f"+{elev_m}m{power_str} (ID: {r['id']})"
+                )
+            return "\n".join(lines)
+        except Exception:
+            log.error("get_recent_rides tool error:\n%s", traceback.format_exc())
+            return "Error fetching recent rides from Strava."
+
+    # ------------------------------------------------------------------ #
+    #  get_athlete_profile                                                  #
+    # ------------------------------------------------------------------ #
+    if name == "get_athlete_profile":
+        try:
+            import requests as _requests
+            user = _refresh_user_tokens(user)
+            resp = _requests.get(
+                f"{strava_client.STRAVA_API}/athlete",
+                headers={"Authorization": f"Bearer {user['access_token']}"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            athlete = resp.json()
+
+            full_name = (
+                f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+                or user.get("name", "Unknown")
+            )
+            weight_str = (
+                f"{user['weight_kg']:.1f} kg (combined rider + bike)"
+                if user.get("weight_kg")
+                else "Not set — needed for CdA calculations"
+            )
+            ftp = athlete.get("ftp")
+            ftp_str = f"{ftp} W" if ftp else "Not set on Strava"
+            city = athlete.get("city", "")
+            country = athlete.get("country", "")
+            location_str = ", ".join(filter(None, [city, country])) or "Not provided"
+
+            integrations = user.get("integrations", {})
+            int_str = ", ".join(k for k, v in integrations.items() if v) or "None"
+
+            return (
+                f"Name: {full_name}\n"
+                f"Location: {location_str}\n"
+                f"Stored weight: {weight_str}\n"
+                f"FTP: {ftp_str}\n"
+                f"Connected integrations: {int_str}"
+            )
+        except Exception:
+            log.error("get_athlete_profile tool error:\n%s", traceback.format_exc())
+            return "Error fetching athlete profile from Strava."
+
+    # ------------------------------------------------------------------ #
+    #  set_weight                                                           #
+    # ------------------------------------------------------------------ #
     if name == "set_weight":
         weight_kg = tool_input.get("weight_kg")
-        if not weight_kg or not (30 <= weight_kg <= 250):
-            return f"Invalid weight value: {weight_kg}. Must be between 30 and 250 kg."
+        try:
+            weight_kg = float(weight_kg)
+        except (TypeError, ValueError):
+            return f"Invalid weight value: {weight_kg!r}. Must be a number between 30 and 250 kg."
+        if not (30 <= weight_kg <= 250):
+            return f"Weight {weight_kg} kg is out of range. Must be between 30 and 250 kg."
         weight_kg = round(weight_kg, 1)
         db.set_weight(user["athlete_id"], weight_kg)
-        user["weight_kg"] = weight_kg  # update in-place for subsequent tool calls
+        user["weight_kg"] = weight_kg  # update in-place for subsequent tool calls this turn
         return f"Weight stored: {weight_kg} kg."
 
-    if name == "get_weight":
-        w = user.get("weight_kg")
-        return f"Stored weight: {w} kg." if w else "No weight stored yet."
+    # ------------------------------------------------------------------ #
+    #  get_cda_history                                                      #
+    # ------------------------------------------------------------------ #
+    if name == "get_cda_history":
+        if user.get("weight_kg") is None:
+            return (
+                "Cannot calculate CdA history: no weight stored. "
+                "Ask the user for their combined rider + bike weight in kg first."
+            )
+        limit = min(int(tool_input.get("limit", 5)), 20)
+        try:
+            user = _refresh_user_tokens(user)
+            rides = _get_recent_outdoor_rides(user["access_token"], limit=limit)
+            if not rides:
+                return "No recent outdoor rides found on your Strava account."
+
+            results = []
+            skipped = 0
+            for r in rides:
+                try:
+                    streams = strava_client.get_activity_streams(r["id"], user["access_token"])
+                    cda, n_samples = cda_calculator.calculate_cda(
+                        streams, user["weight_kg"], crr, rho
+                    )
+                    start_raw = r.get("start_date_local", r.get("start_date", ""))
+                    try:
+                        ride_date = datetime.datetime.fromisoformat(
+                            start_raw.replace("Z", "+00:00")
+                        ).strftime("%d %b %Y")
+                    except Exception:
+                        ride_date = start_raw[:10] if start_raw else "?"
+                    results.append({
+                        "name": r["name"],
+                        "date": ride_date,
+                        "cda": cda,
+                        "n_samples": n_samples,
+                        "id": r["id"],
+                    })
+                except (cda_calculator.NoPowerDataError, cda_calculator.InsufficientDataError):
+                    skipped += 1
+                except Exception:
+                    log.warning(
+                        "CdA history: error on activity %d:\n%s",
+                        r["id"], traceback.format_exc(),
+                    )
+                    skipped += 1
+
+            if not results:
+                return (
+                    f"Could not calculate CdA for any of the last {len(rides)} ride(s) "
+                    f"({skipped} skipped — likely missing power data or insufficient samples)."
+                )
+
+            lines = ["CdA history:\n"]
+            lines.append(f"{'#':<3} {'Date':<14} {'CdA (m²)':<12} {'Samples':<9} Ride")
+            lines.append("-" * 65)
+            for i, r in enumerate(results, 1):
+                lines.append(
+                    f"{i:<3} {r['date']:<14} {r['cda']:.4f}      {r['n_samples']:<9} {r['name']}"
+                )
+            if skipped:
+                lines.append(
+                    f"\n({skipped} ride(s) skipped — no power data or insufficient samples)"
+                )
+
+            if len(results) >= 2:
+                # results are newest-first; trend = newest minus oldest
+                cdas = [r["cda"] for r in results]
+                trend = cdas[0] - cdas[-1]
+                if abs(trend) >= 0.005:
+                    direction = "improving (decreasing)" if trend < 0 else "worsening (increasing)"
+                    lines.append(
+                        f"\nTrend: CdA has been {direction} by "
+                        f"{abs(trend):.4f} m² over these {len(results)} rides."
+                    )
+                else:
+                    lines.append(
+                        "\nTrend: CdA is stable across these rides "
+                        "(variation is within measurement noise)."
+                    )
+
+            return "\n".join(lines)
+        except Exception:
+            log.error("get_cda_history tool error:\n%s", traceback.format_exc())
+            return "Error calculating CdA history."
 
     return f"Unknown tool: {name}"
 
 
-def _chat_with_claude(user: dict, text: str, history: list) -> tuple[str, list]:
+# ---------------------------------------------------------------------------
+# Core Claude agent loop
+# ---------------------------------------------------------------------------
+
+def _run_claude_agent(user: dict, messages: list, max_tokens: int = 1024) -> tuple:
     """
-    Run one user turn through Claude with tool use.
-    Returns (reply_text, updated_history).
-    history is a list of {"role": "user"|"assistant", "content": str}.
+    Run the Claude agent loop with tool use until end_turn.
+    `messages` is a list of Anthropic-format dicts (modified in-place).
+    Returns (reply_text, messages).
     """
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-    # Build message list for this request
-    messages = list(history) + [{"role": "user", "content": text}]
 
     while True:
         with client.messages.stream(
             model="claude-opus-4-6",
-            max_tokens=1024,
+            max_tokens=max_tokens,
             system=_SYSTEM_PROMPT,
             tools=_CLAUDE_TOOLS,
             messages=messages,
@@ -1169,35 +1539,95 @@ def _chat_with_claude(user: dict, text: str, history: list) -> tuple[str, list]:
 
         if response.stop_reason == "end_turn":
             reply = next((b.text for b in response.content if b.type == "text"), "")
-            # Persist only text turns in history
-            new_history = (history + [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": reply},
-            ])[-_MAX_HISTORY:]
-            return reply, new_history
+            messages.append({"role": "assistant", "content": reply})
+            return reply, messages
 
         if response.stop_reason == "tool_use":
-            # Append assistant turn (with tool_use blocks) to working messages
             messages.append({"role": "assistant", "content": response.content})
-
-            # Execute all tool calls
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
                     result = _execute_claude_tool(block.name, block.input, user)
-                    log.info("Tool %s → %r", block.name, result[:120])
+                    log.info("Tool %s → %r", block.name, result[:200])
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
                         "content": result,
                     })
-
             messages.append({"role": "user", "content": tool_results})
         else:
-            # Unexpected stop reason
             break
 
-    return "Something went wrong. Please try again.", history
+    return "Something went wrong. Please try again.", messages
+
+
+def _chat_with_claude(user: dict, text: str, history: list) -> tuple:
+    """
+    Run one user turn through the Claude agent.
+    Returns (reply_text, updated_history).
+    history contains simple {"role": ..., "content": str} dicts for session storage.
+    """
+    messages = list(history) + [{"role": "user", "content": text}]
+    reply, _ = _run_claude_agent(user, messages)
+
+    # Persist only simple text turns in session history (keeps session size manageable)
+    new_history = (history + [
+        {"role": "user", "content": text},
+        {"role": "assistant", "content": reply},
+    ])[-_MAX_HISTORY:]
+    return reply, new_history
+
+
+@app.route("/chat/init")
+def chat_init():
+    """
+    Generate a personalised opening greeting using Claude.
+    Called once per session by the frontend after /chat/status confirms auth.
+    The greeting is cached in the session so it is only generated once.
+    """
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"error": "not authenticated"}), 401
+
+    user = db.get_user_by_athlete(athlete_id)
+    if not user:
+        return jsonify({"error": "user not found"}), 401
+
+    # Return cached greeting if already generated this session
+    cached = session.get("chat_greeting")
+    if cached:
+        return jsonify({"greeting": cached})
+
+    log.info("Generating personalised greeting for athlete %d", athlete_id)
+    try:
+        # Build a minimal context message that asks Claude to introduce itself
+        first_name = (session.get("athlete_name") or user.get("name") or "").split()[0] or "there"
+        init_prompt = (
+            f"The user {first_name} has just opened the Coach Claude chat. "
+            "Fetch their athlete profile and recent rides using your tools, then write a "
+            "short, warm, personalised opening message (2–4 sentences). "
+            "Mention their name, note something specific from their recent rides if available "
+            "(e.g. last ride name or how many rides this week), and offer a concrete next step "
+            "like calculating CdA for a specific ride. Be direct and friendly — no generic "
+            "platitudes. Do not use markdown headers or bullet lists in this greeting."
+        )
+        messages = [{"role": "user", "content": init_prompt}]
+        greeting, _ = _run_claude_agent(user, messages, max_tokens=512)
+        session["chat_greeting"] = greeting
+        # Seed chat history with the greeting so context is preserved
+        session["chat_history"] = [{"role": "assistant", "content": greeting}]
+        return jsonify({"greeting": greeting})
+    except Exception:
+        log.error(
+            "chat_init error for athlete %d:\n%s", athlete_id, traceback.format_exc()
+        )
+        # Fall back to a simple static greeting
+        first_name = (session.get("athlete_name") or "").split()[0] or "there"
+        fallback = (
+            f"Hey {first_name}! I'm Coach Claude, your cycling performance coach. "
+            "Ask me to calculate your CdA, review your recent rides, or analyse your aerodynamics."
+        )
+        return jsonify({"greeting": fallback})
 
 
 @app.route("/chat/message", methods=["POST"])
