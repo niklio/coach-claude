@@ -322,9 +322,10 @@ CHAT_HTML = """<!DOCTYPE html>
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       background: #0a0a0a;
       color: #f0f0f0;
-      height: 100vh;
+      height: 100dvh;
       display: flex;
       flex-direction: column;
+      overflow: hidden;
     }
 
     header {
@@ -419,29 +420,35 @@ CHAT_HTML = """<!DOCTYPE html>
       flex: 1;
       display: none;
       flex-direction: column;
+      min-height: 0;
     }
 
     #messages {
       flex: 1;
       overflow-y: auto;
-      padding: 1.5rem;
+      min-height: 0;
+      padding: 1rem 1.5rem;
       display: flex;
       flex-direction: column;
       gap: 0.75rem;
     }
 
+    /* pushes messages to bottom when there are only a few */
+    #msg-spacer { flex: 1; }
+
     .msg {
       max-width: 75%;
       padding: 0.65rem 1rem;
-      border-radius: 16px;
+      border-radius: 18px;
       font-size: 0.95rem;
       line-height: 1.5;
       white-space: pre-wrap;
       word-break: break-word;
+      flex-shrink: 0;
     }
     .msg.user {
       align-self: flex-end;
-      background: #1d4ed8;
+      background: #2563eb;
       color: #fff;
       border-bottom-right-radius: 4px;
     }
@@ -457,45 +464,54 @@ CHAT_HTML = """<!DOCTYPE html>
       color: #666;
       font-style: italic;
       border-bottom-left-radius: 4px;
+      flex-shrink: 0;
     }
 
     #input-row {
       display: flex;
+      align-items: flex-end;
       gap: 0.5rem;
-      padding: 1rem 1.5rem;
-      border-top: 1px solid #1e1e1e;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid #1a1a1a;
+      flex-shrink: 0;
+      background: #0a0a0a;
     }
     #msg-input {
       flex: 1;
-      background: #1e1e1e;
+      background: #1a1a1a;
       border: 1px solid #2a2a2a;
-      border-radius: 8px;
+      border-radius: 20px;
       color: #f0f0f0;
       font-size: 0.95rem;
-      padding: 0.65rem 1rem;
+      padding: 0.6rem 1rem;
       outline: none;
       resize: none;
-      height: 42px;
+      height: 40px;
       max-height: 120px;
       overflow-y: auto;
       font-family: inherit;
+      line-height: 1.4;
     }
-    #msg-input:focus { border-color: #4ade80; }
+    #msg-input:focus { border-color: #333; }
     #msg-input::placeholder { color: #555; }
     #send-btn {
-      background: #4ade80;
-      color: #0a0a0a;
+      background: #2563eb;
+      color: #fff;
       border: none;
-      border-radius: 8px;
-      font-weight: 700;
-      font-size: 0.9rem;
-      padding: 0 1.1rem;
+      border-radius: 50%;
+      width: 36px;
+      height: 36px;
+      font-size: 1rem;
       cursor: pointer;
       transition: opacity 0.15s;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
     }
     #send-btn:hover { opacity: 0.85; }
-    #send-btn:disabled { opacity: 0.4; cursor: default; }
+    #send-btn:disabled { opacity: 0.35; cursor: default; }
   </style>
 </head>
 <body>
@@ -525,10 +541,12 @@ CHAT_HTML = """<!DOCTYPE html>
 
   <!-- Chat -->
   <div id="chat-screen">
-    <div id="messages"></div>
+    <div id="messages">
+      <div id="msg-spacer"></div>
+    </div>
     <div id="input-row">
       <textarea id="msg-input" placeholder="Message Coach Claude…" rows="1"></textarea>
-      <button id="send-btn">Send</button>
+      <button id="send-btn" aria-label="Send">&#x2191;</button>
     </div>
   </div>
 
@@ -542,7 +560,7 @@ CHAT_HTML = """<!DOCTYPE html>
 
     // ---- phone step ----
     function normalizePhone(raw) {
-      const digits = raw.replace(/\D/g, '');
+      const digits = raw.replace(/\\D/g, '');
       if (digits.length === 10) return '+1' + digits;
       if (digits.length === 11 && digits[0] === '1') return '+' + digits;
       if (digits.length > 7) return '+' + digits;
@@ -573,7 +591,7 @@ CHAT_HTML = """<!DOCTYPE html>
       div.className = 'msg ' + role;
       div.textContent = text;
       messages.appendChild(div);
-      messages.scrollTop = messages.scrollHeight;
+      div.scrollIntoView({ block: 'end' });
       return div;
     }
 
