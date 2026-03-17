@@ -1007,58 +1007,6 @@ def onboarding_integrations():
     return _INTEGRATIONS_HTML, 200, {"Content-Type": "text/html"}
 
 
-# ---------------------------------------------------------------------------
-# Placeholder integration OAuth routes (Garmin OAuth 1.0a, TrainingPeaks)
-# ---------------------------------------------------------------------------
-
-@app.route("/garmin/auth")
-def garmin_auth():
-    """Placeholder — Garmin OAuth 1.0a not yet configured."""
-    return (
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Coach Claude</title>"
-        "<style>body{background:#0a0a0a;color:#f0f0f0;font-family:system-ui,sans-serif;"
-        "display:flex;flex-direction:column;align-items:center;justify-content:center;"
-        "min-height:100dvh;gap:1rem;text-align:center;padding:2rem;}"
-        "h2{font-size:1.3rem;}p{color:#888;max-width:320px;line-height:1.6;}"
-        "a{color:#4ade80;text-decoration:none;font-weight:600;}</style></head>"
-        "<body><h2>Garmin — coming soon</h2>"
-        "<p>Garmin integration is not yet configured. Check back soon.</p>"
-        "<a href='/onboarding/integrations'>&larr; Back</a></body></html>"
-    ), 200, {"Content-Type": "text/html"}
-
-
-@app.route("/garmin/callback")
-def garmin_callback():
-    """Placeholder — Garmin OAuth callback."""
-    return redirect("/onboarding/integrations")
-
-
-@app.route("/tp/auth")
-def tp_auth():
-    """Placeholder — TrainingPeaks OAuth not yet configured."""
-    return (
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Coach Claude</title>"
-        "<style>body{background:#0a0a0a;color:#f0f0f0;font-family:system-ui,sans-serif;"
-        "display:flex;flex-direction:column;align-items:center;justify-content:center;"
-        "min-height:100dvh;gap:1rem;text-align:center;padding:2rem;}"
-        "h2{font-size:1.3rem;}p{color:#888;max-width:320px;line-height:1.6;}"
-        "a{color:#4ade80;text-decoration:none;font-weight:600;}</style></head>"
-        "<body><h2>TrainingPeaks — coming soon</h2>"
-        "<p>TrainingPeaks integration is not yet configured. Check back soon.</p>"
-        "<a href='/onboarding/integrations'>&larr; Back</a></body></html>"
-    ), 200, {"Content-Type": "text/html"}
-
-
-@app.route("/tp/callback")
-def tp_callback():
-    """Placeholder — TrainingPeaks OAuth callback."""
-    return redirect("/onboarding/integrations")
-
-
 @app.route("/chat/status")
 def chat_status():
     athlete_id = session.get("athlete_id")
