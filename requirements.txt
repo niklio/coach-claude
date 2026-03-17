@@ -1,6 +1,7 @@
 flask>=3.0
 gunicorn>=21.0
 requests>=2.31
+requests-oauthlib>=1.3
 numpy>=1.26
 twilio>=9.0
 python-dotenv>=1.0

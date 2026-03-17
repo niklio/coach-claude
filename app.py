@@ -16,6 +16,10 @@ import cda_calculator
 import db
 import sms_sender
 import strava_client
+import integrations.garmin as garmin_integration
+import integrations.training_peaks as tp_integration
+from integrations.garmin import IntegrationNotConfiguredError as GarminNotConfigured
+from integrations.training_peaks import IntegrationNotConfiguredError as TPNotConfigured
 
 load_dotenv()
 
@@ -271,6 +275,7 @@ def oauth_callback():
         state_data = json.loads(base64.urlsafe_b64decode(state + "=="))
         phone = state_data.get("phone", "")
         source = state_data.get("source", "sms")
+        signup_name = state_data.get("name", "")
     except Exception:
         return "Invalid state parameter.", 400
 
@@ -278,31 +283,168 @@ def oauth_callback():
         tokens = strava_client.exchange_code(code)
         athlete = tokens.get("athlete", {})
         athlete_id = athlete["id"]
+        strava_name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
+        # Prefer the name the user typed in the signup form; fall back to Strava name
+        display_name = signup_name or strava_name
         db.upsert_user(
             athlete_id,
             phone,
             tokens["access_token"],
             tokens["refresh_token"],
             tokens["expires_at"],
+            name=display_name,
         )
-        name = f"{athlete.get('firstname', '')} {athlete.get('lastname', '')}".strip()
-        log.info("Authorized athlete %d (%s) with phone %s via %s", athlete_id, name, phone, source)
+        log.info("Authorized athlete %d (%s) with phone %s via %s", athlete_id, display_name, phone, source)
 
         if source == "chat":
             session["athlete_id"] = athlete_id
-            session["athlete_name"] = name
+            session["athlete_name"] = display_name
             public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-            return redirect(f"{public_url}/chat")
+            return redirect(f"{public_url}/onboarding/integrations")
 
         return (
             f"<h2>You're connected to Coach Claude!</h2>"
-            f"<p>Strava account: <strong>{name}</strong></p>"
+            f"<p>Strava account: <strong>{display_name}</strong></p>"
             f"<p>Phone: <strong>{phone}</strong></p>"
             f"<p>Upload an outdoor ride and Coach Claude will text you your CdA. You can close this tab.</p>"
         ), 200
     except Exception as e:
         log.error("OAuth exchange failed: %s", e)
         return f"OAuth failed: {e}", 500
+
+
+# ---------------------------------------------------------------------------
+# Garmin OAuth
+# ---------------------------------------------------------------------------
+
+_GARMIN_NOT_CONFIGURED_HTML = (
+    "<h2>Garmin integration coming soon</h2>"
+    "<p>Garmin Connect support is not yet enabled on this server. "
+    "Check back later!</p>"
+)
+
+
+@app.route("/garmin/auth")
+def garmin_auth():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return "Not authenticated — please connect your Strava account first.", 401
+
+    try:
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        callback_url = f"{public_url}/garmin/callback"
+        authorize_url, token_secret = garmin_integration.get_auth_url(callback_url)
+        session["garmin_token_secret"] = token_secret
+        return redirect(authorize_url)
+    except GarminNotConfigured:
+        log.warning("Garmin integration not configured — returning coming-soon page")
+        return _GARMIN_NOT_CONFIGURED_HTML, 503
+
+
+@app.route("/garmin/callback")
+def garmin_callback():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return "Not authenticated.", 401
+
+    oauth_token = request.args.get("oauth_token", "")
+    oauth_verifier = request.args.get("oauth_verifier", "")
+    token_secret = session.pop("garmin_token_secret", "")
+
+    if not oauth_token or not oauth_verifier:
+        return "Missing OAuth parameters from Garmin.", 400
+
+    try:
+        tokens = garmin_integration.exchange_token(oauth_token, oauth_verifier, token_secret)
+        db.update_integration(athlete_id, "garmin", tokens)
+        log.info("Garmin connected for athlete %d", athlete_id)
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        return redirect(f"{public_url}/onboarding/integrations")
+    except GarminNotConfigured:
+        return _GARMIN_NOT_CONFIGURED_HTML, 503
+    except Exception as e:
+        log.error("Garmin token exchange failed for athlete %d: %s", athlete_id, e)
+        return f"Garmin authorization failed: {e}", 500
+
+
+# ---------------------------------------------------------------------------
+# TrainingPeaks OAuth
+# ---------------------------------------------------------------------------
+
+_TP_NOT_CONFIGURED_HTML = (
+    "<h2>TrainingPeaks integration coming soon</h2>"
+    "<p>TrainingPeaks support is not yet enabled on this server. "
+    "Check back later!</p>"
+)
+
+
+@app.route("/tp/auth")
+def tp_auth():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return "Not authenticated — please connect your Strava account first.", 401
+
+    try:
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        callback_url = f"{public_url}/tp/callback"
+        state = base64.urlsafe_b64encode(
+            json.dumps({"athlete_id": athlete_id}).encode()
+        ).decode()
+        authorize_url = tp_integration.get_auth_url(callback_url, state=state)
+        return redirect(authorize_url)
+    except TPNotConfigured:
+        log.warning("TrainingPeaks integration not configured — returning coming-soon page")
+        return _TP_NOT_CONFIGURED_HTML, 503
+
+
+@app.route("/tp/callback")
+def tp_callback():
+    code = request.args.get("code", "")
+    error = request.args.get("error", "")
+    state = request.args.get("state", "")
+
+    if error or not code:
+        return f"TrainingPeaks authorization failed: {error or 'no code'}", 400
+
+    # Recover athlete_id from state (set in /tp/auth) or fall back to session
+    try:
+        state_data = json.loads(base64.urlsafe_b64decode(state + "=="))
+        athlete_id = state_data.get("athlete_id") or session.get("athlete_id")
+    except Exception:
+        athlete_id = session.get("athlete_id")
+
+    if not athlete_id:
+        return "Not authenticated.", 401
+
+    try:
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        callback_url = f"{public_url}/tp/callback"
+        tokens = tp_integration.exchange_code(code, callback_url)
+        db.update_integration(athlete_id, "trainingpeaks", tokens)
+        log.info("TrainingPeaks connected for athlete %d", athlete_id)
+        return redirect(f"{public_url}/onboarding/integrations")
+    except TPNotConfigured:
+        return _TP_NOT_CONFIGURED_HTML, 503
+    except Exception as e:
+        log.error("TrainingPeaks token exchange failed for athlete %d: %s", athlete_id, e)
+        return f"TrainingPeaks authorization failed: {e}", 500
+
+
+# ---------------------------------------------------------------------------
+# Integration status
+# ---------------------------------------------------------------------------
+
+@app.route("/integrations/status")
+def integrations_status():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"error": "Not authenticated"}), 401
+
+    integrations = db.get_user_integrations(athlete_id)
+    return jsonify({
+        "garmin": "garmin" in integrations,
+        "trainingpeaks": "trainingpeaks" in integrations,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -520,10 +662,14 @@ CHAT_HTML = """<!DOCTYPE html>
     <div class="logo">Coach Claude</div>
   </header>
 
-  <!-- Step 1: phone number -->
+  <!-- Step 1: name + phone number -->
   <div id="phone-screen" class="signup-screen active">
     <h2>Get started</h2>
-    <p>Coach Claude analyses your outdoor rides and texts you your aerodynamic CdA. Enter your phone number to create your account.</p>
+    <p>Coach Claude analyses your outdoor rides and texts you your aerodynamic CdA. Enter your details to create your account.</p>
+    <div class="field-group">
+      <label for="name-input">Your name</label>
+      <input id="name-input" class="text-input" type="text" placeholder="Jane Smith" autocomplete="name" />
+    </div>
     <div class="field-group">
       <label for="phone-input">Phone number</label>
       <input id="phone-input" class="text-input" type="tel" placeholder="+1 555 000 0000" autocomplete="tel" />
@@ -558,7 +704,7 @@ CHAT_HTML = """<!DOCTYPE html>
     const input        = document.getElementById('msg-input');
     const sendBtn      = document.getElementById('send-btn');
 
-    // ---- phone step ----
+    // ---- phone + name step ----
     function normalizePhone(raw) {
       const digits = raw.replace(/\\D/g, '');
       if (digits.length === 10) return '+1' + digits;
@@ -569,6 +715,7 @@ CHAT_HTML = """<!DOCTYPE html>
 
     document.getElementById('phone-next-btn').addEventListener('click', () => {
       const raw = document.getElementById('phone-input').value.trim();
+      const name = document.getElementById('name-input').value.trim();
       const phone = normalizePhone(raw);
       const err = document.getElementById('phone-error');
       if (!phone) {
@@ -576,11 +723,16 @@ CHAT_HTML = """<!DOCTYPE html>
         return;
       }
       err.textContent = '';
-      document.getElementById('strava-link').href = '/chat/auth?phone=' + encodeURIComponent(phone);
+      const params = new URLSearchParams({ phone });
+      if (name) params.set('name', name);
+      document.getElementById('strava-link').href = '/chat/auth?' + params.toString();
       phoneScreen.classList.remove('active');
       stravaScreen.classList.add('active');
     });
 
+    document.getElementById('name-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') document.getElementById('phone-input').focus();
+    });
     document.getElementById('phone-input').addEventListener('keydown', e => {
       if (e.key === 'Enter') document.getElementById('phone-next-btn').click();
     });
@@ -668,9 +820,238 @@ def chat_ui():
 @app.route("/chat/auth")
 def chat_auth():
     phone = request.args.get("phone", "").strip()
+    name = request.args.get("name", "").strip()
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-    state = base64.urlsafe_b64encode(json.dumps({"phone": phone, "source": "chat"}).encode()).decode()
+    state_payload = {"phone": phone, "source": "chat"}
+    if name:
+        state_payload["name"] = name
+    state = base64.urlsafe_b64encode(json.dumps(state_payload).encode()).decode()
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
+
+
+_INTEGRATIONS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude — Connect your data</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a;
+      color: #f0f0f0;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      padding: 1rem 1.5rem;
+      border-bottom: 1px solid #1e1e1e;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    header .logo { font-weight: 800; font-size: 1.1rem; color: #fff; }
+    header .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #4ade80; flex-shrink: 0;
+    }
+
+    main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2.5rem 1.5rem 3rem;
+      gap: 1.5rem;
+      max-width: 480px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .heading { text-align: center; }
+    .heading h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }
+    .heading p { color: #888; line-height: 1.6; font-size: 0.95rem; }
+
+    .tiles {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      width: 100%;
+    }
+
+    .tile {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .tile-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3rem;
+      font-weight: 800;
+    }
+    .tile-icon.garmin  { background: #0066cc; color: #fff; }
+    .tile-icon.tp      { background: #e87722; color: #fff; }
+    .tile-icon.apple   { background: #2a2a2a; color: #aaa; }
+
+    .tile-info { flex: 1; min-width: 0; }
+    .tile-info .tile-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
+    .tile-info .tile-desc { font-size: 0.8rem; color: #777; line-height: 1.4; }
+
+    .connect-btn {
+      background: #4ade80;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 7px;
+      font-weight: 700;
+      font-size: 0.82rem;
+      padding: 0.5rem 1rem;
+      cursor: pointer;
+      text-decoration: none;
+      white-space: nowrap;
+      transition: opacity 0.15s;
+      flex-shrink: 0;
+    }
+    .connect-btn:hover { opacity: 0.85; }
+    .connect-btn.disabled {
+      background: #2a2a2a;
+      color: #555;
+      cursor: default;
+      pointer-events: none;
+    }
+
+    .skip-link {
+      color: #555;
+      font-size: 0.88rem;
+      text-decoration: none;
+      margin-top: 0.5rem;
+      transition: color 0.15s;
+    }
+    .skip-link:hover { color: #888; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dot"></div>
+    <div class="logo">Coach Claude</div>
+  </header>
+
+  <main>
+    <div class="heading">
+      <h2>Connect your data sources</h2>
+      <p>Strava is connected. Optionally link additional sources for richer analysis.</p>
+    </div>
+
+    <div class="tiles">
+
+      <!-- Garmin -->
+      <div class="tile">
+        <div class="tile-icon garmin">G</div>
+        <div class="tile-info">
+          <div class="tile-name">Garmin Connect</div>
+          <div class="tile-desc">Sync heart rate, power, and fitness metrics from your Garmin device.</div>
+        </div>
+        <a href="/garmin/auth" class="connect-btn">Connect</a>
+      </div>
+
+      <!-- TrainingPeaks -->
+      <div class="tile">
+        <div class="tile-icon tp">TP</div>
+        <div class="tile-info">
+          <div class="tile-name">TrainingPeaks</div>
+          <div class="tile-desc">Import your structured training plans and TSS/ATL/CTL data.</div>
+        </div>
+        <a href="/tp/auth" class="connect-btn">Connect</a>
+      </div>
+
+      <!-- Apple Health -->
+      <div class="tile">
+        <div class="tile-icon apple">&#xf8ff;</div>
+        <div class="tile-info">
+          <div class="tile-name">Apple Health</div>
+          <div class="tile-desc">Available on the iOS app — sync sleep, HRV, and activity data.</div>
+        </div>
+        <span class="connect-btn disabled">iOS only</span>
+      </div>
+
+    </div>
+
+    <a href="/chat" class="skip-link">Skip for now &rarr;</a>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.route("/onboarding/integrations")
+def onboarding_integrations():
+    return _INTEGRATIONS_HTML, 200, {"Content-Type": "text/html"}
+
+
+# ---------------------------------------------------------------------------
+# Placeholder integration OAuth routes (Garmin OAuth 1.0a, TrainingPeaks)
+# ---------------------------------------------------------------------------
+
+@app.route("/garmin/auth")
+def garmin_auth():
+    """Placeholder — Garmin OAuth 1.0a not yet configured."""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Coach Claude</title>"
+        "<style>body{background:#0a0a0a;color:#f0f0f0;font-family:system-ui,sans-serif;"
+        "display:flex;flex-direction:column;align-items:center;justify-content:center;"
+        "min-height:100dvh;gap:1rem;text-align:center;padding:2rem;}"
+        "h2{font-size:1.3rem;}p{color:#888;max-width:320px;line-height:1.6;}"
+        "a{color:#4ade80;text-decoration:none;font-weight:600;}</style></head>"
+        "<body><h2>Garmin — coming soon</h2>"
+        "<p>Garmin integration is not yet configured. Check back soon.</p>"
+        "<a href='/onboarding/integrations'>&larr; Back</a></body></html>"
+    ), 200, {"Content-Type": "text/html"}
+
+
+@app.route("/garmin/callback")
+def garmin_callback():
+    """Placeholder — Garmin OAuth callback."""
+    return redirect("/onboarding/integrations")
+
+
+@app.route("/tp/auth")
+def tp_auth():
+    """Placeholder — TrainingPeaks OAuth not yet configured."""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Coach Claude</title>"
+        "<style>body{background:#0a0a0a;color:#f0f0f0;font-family:system-ui,sans-serif;"
+        "display:flex;flex-direction:column;align-items:center;justify-content:center;"
+        "min-height:100dvh;gap:1rem;text-align:center;padding:2rem;}"
+        "h2{font-size:1.3rem;}p{color:#888;max-width:320px;line-height:1.6;}"
+        "a{color:#4ade80;text-decoration:none;font-weight:600;}</style></head>"
+        "<body><h2>TrainingPeaks — coming soon</h2>"
+        "<p>TrainingPeaks integration is not yet configured. Check back soon.</p>"
+        "<a href='/onboarding/integrations'>&larr; Back</a></body></html>"
+    ), 200, {"Content-Type": "text/html"}
+
+
+@app.route("/tp/callback")
+def tp_callback():
+    """Placeholder — TrainingPeaks OAuth callback."""
+    return redirect("/onboarding/integrations")
 
 
 @app.route("/chat/status")

@@ -11,7 +11,14 @@ def _ref(athlete_id: int):
     return _db.collection(_USERS).document(str(athlete_id))
 
 
-def upsert_user(athlete_id: int, phone: str, access_token: str, refresh_token: str, expires_at: int) -> None:
+def upsert_user(
+    athlete_id: int,
+    phone: str,
+    access_token: str,
+    refresh_token: str,
+    expires_at: int,
+    name: str = "",
+) -> None:
     doc = _ref(athlete_id)
     existing = doc.get().to_dict() or {}
     data = {
@@ -27,6 +34,8 @@ def upsert_user(athlete_id: int, phone: str, access_token: str, refresh_token: s
         data["phone_number"] = phone
     elif "phone_number" not in existing:
         data["phone_number"] = ""
+    if name:
+        data["name"] = name
     doc.set(data, merge=True)
 
 
@@ -54,6 +63,37 @@ def set_weight(athlete_id: int, weight_kg: float) -> None:
 
 def set_awaiting_weight(athlete_id: int, awaiting: bool) -> None:
     _ref(athlete_id).update({"awaiting_weight": awaiting})
+
+
+def update_integrations(athlete_id: int, integrations: dict) -> None:
+    """Merge integration connection state into the user document.
+
+    integrations example: {"garmin": True, "training_peaks": True}
+    """
+    _ref(athlete_id).set({"integrations": integrations}, merge=True)
+
+
+def get_user_integrations(athlete_id: int) -> dict:
+    """Returns dict of connected integrations.
+
+    e.g. {'garmin': {'oauth_token': '...', 'oauth_token_secret': '...'},
+           'trainingpeaks': {'access_token': '...', 'refresh_token': '...'}}
+    """
+    doc = _ref(athlete_id).get()
+    if not doc.exists:
+        return {}
+    data = doc.to_dict() or {}
+    return data.get("integrations", {})
+
+
+def update_integration(athlete_id: int, integration: str, tokens: dict) -> None:
+    """Store tokens for a named integration under integrations.{name} in Firestore."""
+    _ref(athlete_id).set({"integrations": {integration: tokens}}, merge=True)
+
+
+def remove_integration(athlete_id: int, integration: str) -> None:
+    """Remove a named integration from the user document."""
+    _ref(athlete_id).update({f"integrations.{integration}": firestore.DELETE_FIELD})
 
 
 def user_count() -> int:
