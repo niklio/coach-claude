@@ -6,25 +6,56 @@ from twilio.rest import Client
 
 log = logging.getLogger(__name__)
 
+# Standard footer appended to the FIRST message sent to a new user.
+# Required by A2P 10DLC: opt-out instruction + rates disclosure.
+_OPT_IN_FOOTER = "\n\nReply STOP to unsubscribe. Msg & data rates may apply."
+
+# HELP auto-response text (returned by /sms/inbound when user texts HELP).
+HELP_RESPONSE = (
+    "Coach Claude — cycling CdA analysis via Strava. "
+    "Commands: 'last ride' | 'change weight'. "
+    "Support: nikliolios@irlll.com. "
+    "Reply STOP to unsubscribe."
+)
+
+# STOP acknowledgement (Twilio handles STOP natively at the carrier level, but
+# we also intercept it in /sms/inbound so we can mark the user opted-out in DB).
+STOP_RESPONSE = (
+    "You have been unsubscribed from Coach Claude. "
+    "No further messages will be sent. "
+    "Text START to resubscribe."
+)
+
 
 def _client() -> Client:
     return Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
 
 
 def _send(to: str, body: str) -> None:
+    """Send an SMS. Attaches a status_callback if PUBLIC_URL is set."""
+    kwargs: dict = {
+        "body": body,
+        "from_": os.getenv("TWILIO_FROM_NUMBER"),
+        "to": to,
+    }
+    public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
+    if public_url:
+        kwargs["status_callback"] = f"{public_url}/sms/status"
     try:
-        msg = _client().messages.create(body=body, from_=os.getenv("TWILIO_FROM_NUMBER"), to=to)
+        msg = _client().messages.create(**kwargs)
         log.info("SMS sent to %s: SID %s", to, msg.sid)
     except TwilioRestException as e:
         log.error("Failed to send SMS to %s: %s", to, e)
 
 
 def send_weight_request(to: str) -> None:
+    """First outbound message to a new user — must include A2P opt-in footer."""
     _send(
         to,
         "Hey, this is Coach Claude! I'll text you your CdA after every outdoor Strava ride. "
         "First, what's your combined rider + bike weight? "
-        "Reply with a number in kg (e.g. 75) or lbs (e.g. 165 lbs).",
+        "Reply with a number in kg (e.g. 75) or lbs (e.g. 165 lbs)."
+        + _OPT_IN_FOOTER,
     )
 
 

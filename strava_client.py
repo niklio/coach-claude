@@ -89,6 +89,40 @@ def get_last_outdoor_ride(access_token: str) -> dict | None:
     return None
 
 
+def get_all_activities(access_token: str, after: int, per_page: int = 200) -> list:
+    """Fetch all activities after a unix timestamp, paginating until exhausted.
+
+    Parameters
+    ----------
+    access_token:
+        Valid Strava Bearer token.
+    after:
+        Unix timestamp.  Only activities that started after this time are returned.
+    per_page:
+        Page size (Strava max is 200).
+
+    Returns a flat list of activity summary dicts.
+    """
+    activities = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"{STRAVA_API}/athlete/activities",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"after": after, "per_page": per_page, "page": page},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        activities.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    return activities
+
+
 def get_activity_streams(activity_id: int, access_token: str) -> dict:
     keys = "time,velocity_smooth,watts,altitude,grade_smooth"
     resp = requests.get(

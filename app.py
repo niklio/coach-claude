@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request, session
 from twilio.twiml.messaging_response import MessagingResponse
 
+import athlete_profile as athlete_profile_module
 import cda_calculator
 import db
 import sms_sender
@@ -37,6 +38,50 @@ app.secret_key = os.getenv("SECRET_KEY", "change-me")
 ADMIN_EMAIL = "nikliolios@irlll.com"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+ALLOWED_PHONES = {p.strip() for p in os.getenv("ALLOWED_PHONES", "+16035317244").split(",") if p.strip()}
+
+
+# ---------------------------------------------------------------------------
+# Phone allowlist helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize to E.164 for comparison. Strips non-digits, prepends +1 for 10-digit numbers."""
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 10:
+        digits = "1" + digits
+    return "+" + digits
+
+
+_PRIVATE_BETA_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude — Private Beta</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a; color: #f0f0f0;
+      min-height: 100dvh; display: flex;
+      align-items: center; justify-content: center;
+      padding: 2rem 1.5rem;
+    }
+    .card { text-align: center; max-width: 400px; }
+    .logo { font-weight: 800; font-size: 1.1rem; color: #fff; margin-bottom: 2rem; }
+    h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.75rem; }
+    p { color: #888; line-height: 1.6; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Coach Claude</div>
+    <h1>Private Beta</h1>
+    <p>This app is in private beta. Access is by invitation only.</p>
+  </div>
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +225,12 @@ def _process_activity(activity_id: int, athlete_id: int) -> None:
 
         activity_name = activity.get("name", "Unnamed ride")
 
+        # Respect SMS opt-out: do not send any outbound SMS if the user has
+        # previously replied STOP.
+        if user.get("sms_opted_out"):
+            log.info("Skipping SMS for opted-out user athlete_id=%d", athlete_id)
+            return
+
         # If we don't have this user's weight, ask for it (once)
         if user["weight_kg"] is None:
             if not user["awaiting_weight"]:
@@ -223,11 +274,48 @@ def _lookup_last_cda(user: dict) -> None:
     sms_sender._send(user["phone_number"], reply)
 
 
+def _is_stop_keyword(text: str) -> bool:
+    return text.upper().strip() in {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
+
+
+def _is_start_keyword(text: str) -> bool:
+    return text.upper().strip() in {"START", "UNSTOP", "YES"}
+
+
+def _is_help_keyword(text: str) -> bool:
+    return text.upper().strip() in {"HELP", "INFO"}
+
+
 @app.route("/sms/inbound", methods=["POST"])
 def sms_inbound():
     from_number = request.form.get("From", "").strip()
     body = request.form.get("Body", "").strip()
     log.info("Inbound SMS from %s: %r", from_number, body)
+
+    if _normalize_phone(from_number) not in ALLOWED_PHONES:
+        return _twiml("This service is in private beta and not accepting new users.")
+
+    # ---------------------------------------------------------------------------
+    # A2P 10DLC compliance: handle STOP / START / HELP before any other logic.
+    # Twilio automatically blocks outbound messages to opted-out numbers at the
+    # carrier level, but we also track opt-out state in DB so we don't attempt
+    # to send and burn retry logic.
+    # ---------------------------------------------------------------------------
+    if _is_stop_keyword(body):
+        user = db.get_user_by_phone(from_number)
+        if user:
+            db.set_sms_opted_out(user["athlete_id"], True)
+        # Return the STOP response; Twilio will also enforce carrier-level block.
+        return _twiml(sms_sender.STOP_RESPONSE)
+
+    if _is_start_keyword(body):
+        user = db.get_user_by_phone(from_number)
+        if user:
+            db.set_sms_opted_out(user["athlete_id"], False)
+        return _twiml("You have been resubscribed to Coach Claude. Reply STOP at any time to unsubscribe.")
+
+    if _is_help_keyword(body):
+        return _twiml(sms_sender.HELP_RESPONSE)
 
     user = db.get_user_by_phone(from_number)
     if not user:
@@ -239,15 +327,53 @@ def sms_inbound():
             f"To get started, connect your Strava account:\n{auth_url}"
         )
 
-    if _wants_last_cda(body):
-        if user["weight_kg"] is None:
-            return _twiml("I don't have your weight yet — reply with your combined rider + bike weight in kg or lbs first.")
-        t = threading.Thread(target=_lookup_last_cda, args=(user,), daemon=True)
-        t.start()
-        return _twiml("Looking up your last ride...")
+    # Respect opt-out: if user previously sent STOP, do not reply.
+    if user.get("sms_opted_out"):
+        log.info("Ignoring inbound SMS from opted-out user %s", from_number)
+        return "", 204
 
-    reply = _process_message(user, body)
+    # Route all messages through the Claude coach agent, same as the chat UI.
+    # History is persisted in Firestore so the conversation carries across SMS threads.
+    sms_history = db.get_sms_history(user["athlete_id"])
+    try:
+        reply, updated_history = _chat_with_claude(user, body, sms_history, max_tokens=512)
+        db.set_sms_history(user["athlete_id"], updated_history)
+    except Exception:
+        log.error("Claude SMS error for athlete %d:\n%s", user["athlete_id"], traceback.format_exc())
+        reply = "Something went wrong — please try again."
+
+    # SMS messages have a practical limit; truncate gracefully if Claude goes long.
+    if len(reply) > 1500:
+        reply = reply[:1497] + "…"
+
     return _twiml(reply)
+
+
+# ---------------------------------------------------------------------------
+# Twilio SMS status callback — required for A2P 10DLC delivery monitoring
+# ---------------------------------------------------------------------------
+
+@app.route("/sms/status", methods=["POST"])
+def sms_status():
+    """Receives delivery status updates from Twilio for outbound messages.
+
+    Twilio posts MessageSid, MessageStatus, To, From, and ErrorCode.
+    Status values: queued, sent, delivered, undelivered, failed.
+    """
+    sid = request.form.get("MessageSid", "")
+    status = request.form.get("MessageStatus", "")
+    to = request.form.get("To", "")
+    error_code = request.form.get("ErrorCode", "")
+
+    if status in ("undelivered", "failed"):
+        log.warning(
+            "SMS delivery %s for SID %s to %s (ErrorCode: %s)",
+            status, sid, to, error_code or "none",
+        )
+    else:
+        log.info("SMS status %s for SID %s to %s", status, sid, to)
+
+    return "", 204
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +388,8 @@ def auth():
             "<h2>Coach Claude — Connect your Strava account</h2>"
             "<p>Add your phone number to the URL: <code>/auth?phone=+1XXXXXXXXXX</code></p>"
         ), 400
+    if _normalize_phone(phone) not in ALLOWED_PHONES:
+        return _PRIVATE_BETA_HTML, 403, {"Content-Type": "text/html"}
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
     state = base64.urlsafe_b64encode(json.dumps({"phone": phone, "source": "sms"}).encode()).decode()
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
@@ -304,8 +432,15 @@ def oauth_callback():
         if source == "chat":
             session["athlete_id"] = athlete_id
             session["athlete_name"] = display_name
+            # Kick off background profile build — do not block the redirect
+            _user_for_profile = db.get_user_by_athlete(athlete_id) or {}
+            threading.Thread(
+                target=_safe_build_profile,
+                args=(_user_for_profile,),
+                daemon=True,
+            ).start()
             public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-            return redirect(f"{public_url}/onboarding/integrations")
+            return redirect(f"{public_url}/onboarding")
 
         return (
             f"<h2>You're connected to Coach Claude!</h2>"
@@ -363,8 +498,10 @@ def garmin_callback():
         tokens = garmin_integration.exchange_token(oauth_token, oauth_verifier, token_secret)
         db.update_integration(athlete_id, "garmin", tokens)
         log.info("Garmin connected for athlete %d", athlete_id)
+        _garmin_user = db.get_user_by_athlete(athlete_id) or {}
+        threading.Thread(target=_safe_build_profile, args=(_garmin_user,), daemon=True).start()
         public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
-        return redirect(f"{public_url}/onboarding/integrations")
+        return redirect(f"{public_url}/onboarding")
     except GarminNotConfigured:
         return _GARMIN_NOT_CONFIGURED_HTML, 503
     except Exception as e:
@@ -427,12 +564,32 @@ def tp_callback():
         tokens = tp_integration.exchange_code(code, callback_url)
         db.update_integration(athlete_id, "trainingpeaks", tokens)
         log.info("TrainingPeaks connected for athlete %d", athlete_id)
-        return redirect(f"{public_url}/onboarding/integrations")
+        _tp_user = db.get_user_by_athlete(athlete_id) or {}
+        threading.Thread(target=_safe_build_profile, args=(_tp_user,), daemon=True).start()
+        return redirect(f"{public_url}/onboarding")
     except TPNotConfigured:
         return _TP_NOT_CONFIGURED_HTML, 503
     except Exception as e:
         log.error("TrainingPeaks token exchange failed for athlete %d: %s", athlete_id, e)
         return f"TrainingPeaks authorization failed: {e}", 500
+
+
+# ---------------------------------------------------------------------------
+# Athlete profile background helper
+# ---------------------------------------------------------------------------
+
+def _safe_build_profile(user: dict) -> None:
+    """Build and store the athlete profile in a background thread, swallowing errors."""
+    try:
+        if not user or not user.get("athlete_id"):
+            log.warning("_safe_build_profile called with empty/invalid user — skipping.")
+            return
+        athlete_profile_module.build_and_store_profile(user)
+    except Exception:
+        log.exception(
+            "Background profile build failed for athlete %s",
+            user.get("athlete_id", "unknown"),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -475,17 +632,32 @@ CHAT_HTML = """<!DOCTYPE html>
       overflow: hidden;
     }
 
+    /* --- header --- */
     header {
-      padding: 1rem 1.5rem;
-      border-bottom: 1px solid #1e1e1e;
+      padding: 0.85rem 1.5rem;
+      border-bottom: 1px solid #1a1a1a;
       display: flex;
       align-items: center;
-      gap: 0.75rem;
+      gap: 0.6rem;
+      background: #0d0d0d;
+      flex-shrink: 0;
     }
-    header .logo { font-weight: 800; font-size: 1.1rem; color: #fff; }
-    header .dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: #4ade80; flex-shrink: 0;
+    header .logo {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: #e8e8e8;
+      letter-spacing: 0.01em;
+    }
+    header .online-dot {
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #4ade80;
+      flex-shrink: 0;
+      box-shadow: 0 0 4px rgba(74, 222, 128, 0.6);
+    }
+    header .online-label {
+      font-size: 0.75rem;
+      color: #4ade80;
+      font-weight: 500;
     }
 
     /* --- signup screens --- */
@@ -574,59 +746,85 @@ CHAT_HTML = """<!DOCTYPE html>
       flex: 1;
       overflow-y: auto;
       min-height: 0;
-      padding: 1rem 1.5rem;
+      padding: 1.25rem 1.5rem 0.5rem;
       display: flex;
       flex-direction: column;
-      gap: 0.75rem;
+      gap: 1rem;
     }
 
     /* pushes messages to bottom when there are only a few */
     #msg-spacer { flex: 1; }
 
     .msg {
-      max-width: 75%;
-      padding: 0.65rem 1rem;
-      border-radius: 18px;
       font-size: 0.95rem;
-      line-height: 1.5;
+      line-height: 1.6;
       white-space: pre-wrap;
       word-break: break-word;
       flex-shrink: 0;
     }
     .msg.user {
       align-self: flex-end;
+      max-width: 72%;
       background: #2563eb;
       color: #fff;
+      padding: 0.6rem 0.95rem;
+      border-radius: 18px;
       border-bottom-right-radius: 4px;
+      font-weight: 400;
     }
     .msg.coach {
       align-self: flex-start;
-      background: #1e1e1e;
-      color: #f0f0f0;
-      border-bottom-left-radius: 4px;
+      max-width: 85%;
+      background: transparent;
+      color: #d4d4d4;
+      font-weight: 300;
+      padding: 0.1rem 0 0.1rem 1rem;
+      border-left: 2px solid #4ade80;
     }
     .msg.typing {
       align-self: flex-start;
-      background: #1e1e1e;
-      color: #666;
-      font-style: italic;
-      border-bottom-left-radius: 4px;
+      padding: 0.1rem 0 0.1rem 1rem;
+      border-left: 2px solid #2a2a2a;
       flex-shrink: 0;
     }
 
+    /* three-dot pulse animation */
+    .dots {
+      display: inline-flex;
+      gap: 4px;
+      align-items: center;
+      height: 1.4em;
+    }
+    .dots span {
+      display: inline-block;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #555;
+      animation: dotPulse 1.2s ease-in-out infinite;
+    }
+    .dots span:nth-child(2) { animation-delay: 0.2s; }
+    .dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes dotPulse {
+      0%, 80%, 100% { opacity: 0.2; transform: scale(0.85); }
+      40%            { opacity: 1;   transform: scale(1.1); }
+    }
+
+    #input-area {
+      flex-shrink: 0;
+      padding: 0.75rem 1rem 0.5rem;
+      border-top: 1px solid #161616;
+      background: #0a0a0a;
+    }
     #input-row {
       display: flex;
       align-items: flex-end;
       gap: 0.5rem;
-      padding: 0.75rem 1rem;
-      border-top: 1px solid #1a1a1a;
-      flex-shrink: 0;
-      background: #0a0a0a;
     }
     #msg-input {
       flex: 1;
-      background: #1a1a1a;
-      border: 1px solid #2a2a2a;
+      background: #161616;
+      border: 1px solid #262626;
       border-radius: 20px;
       color: #f0f0f0;
       font-size: 0.95rem;
@@ -639,8 +837,8 @@ CHAT_HTML = """<!DOCTYPE html>
       font-family: inherit;
       line-height: 1.4;
     }
-    #msg-input:focus { border-color: #333; }
-    #msg-input::placeholder { color: #555; }
+    #msg-input:focus { border-color: #2a2a2a; }
+    #msg-input::placeholder { color: #444; }
     #send-btn {
       background: #2563eb;
       color: #fff;
@@ -659,15 +857,31 @@ CHAT_HTML = """<!DOCTYPE html>
     }
     #send-btn:hover { opacity: 0.85; }
     #send-btn:disabled { opacity: 0.35; cursor: default; }
+
+    #powered-by {
+      text-align: center;
+      font-size: 0.7rem;
+      color: #2e2e2e;
+      padding: 0.35rem 0 0.25rem;
+      letter-spacing: 0.02em;
+    }
   </style>
 </head>
 <body>
   <header>
-    <div class="dot"></div>
+    <div class="online-dot"></div>
     <div class="logo">Coach Claude</div>
+    <div class="online-label">online</div>
   </header>
 
-  <!-- Step 1: name + phone number -->
+  <!-- Unauthenticated: Connect Strava state -->
+  <div id="connect-screen" class="signup-screen" style="display:none;">
+    <h2>Connect Strava to start</h2>
+    <p>Coach Claude analyses your training data and gives you personalised coaching. Connect your Strava account to begin.</p>
+    <a href="/onboarding" class="strava-btn">Get started</a>
+  </div>
+
+  <!-- Fallback: phone + name form (for direct /chat access without session) -->
   <div id="phone-screen" class="signup-screen active">
     <h2>Get started</h2>
     <p>Coach Claude analyses your outdoor rides and texts you your aerodynamic CdA. Enter your details to create your account.</p>
@@ -683,7 +897,7 @@ CHAT_HTML = """<!DOCTYPE html>
     <button id="phone-next-btn" class="primary-btn">Continue</button>
   </div>
 
-  <!-- Step 2: connect Strava -->
+  <!-- Step 2: connect Strava (after phone entry) -->
   <div id="strava-screen" class="signup-screen">
     <h2>Connect Strava</h2>
     <p>Almost there. Connect your Strava account so Coach Claude can analyse your rides.</p>
@@ -695,19 +909,23 @@ CHAT_HTML = """<!DOCTYPE html>
     <div id="messages">
       <div id="msg-spacer"></div>
     </div>
-    <div id="input-row">
-      <textarea id="msg-input" placeholder="Message Coach Claude…" rows="1"></textarea>
-      <button id="send-btn" aria-label="Send">&#x2191;</button>
+    <div id="input-area">
+      <div id="input-row">
+        <textarea id="msg-input" placeholder="Ask your coach anything..." rows="1"></textarea>
+        <button id="send-btn" aria-label="Send">&#x2191;</button>
+      </div>
+      <div id="powered-by">Powered by Claude</div>
     </div>
   </div>
 
   <script>
-    const phoneScreen  = document.getElementById('phone-screen');
-    const stravaScreen = document.getElementById('strava-screen');
-    const chatScreen   = document.getElementById('chat-screen');
-    const messages     = document.getElementById('messages');
-    const input        = document.getElementById('msg-input');
-    const sendBtn      = document.getElementById('send-btn');
+    const phoneScreen   = document.getElementById('phone-screen');
+    const connectScreen = document.getElementById('connect-screen');
+    const stravaScreen  = document.getElementById('strava-screen');
+    const chatScreen    = document.getElementById('chat-screen');
+    const messages      = document.getElementById('messages');
+    const input         = document.getElementById('msg-input');
+    const sendBtn       = document.getElementById('send-btn');
 
     // ---- phone + name step ----
     function normalizePhone(raw) {
@@ -752,15 +970,24 @@ CHAT_HTML = """<!DOCTYPE html>
       return div;
     }
 
+    function addTyping() {
+      const div = document.createElement('div');
+      div.className = 'msg typing';
+      div.innerHTML = '<span class="dots"><span></span><span></span><span></span></span>';
+      messages.appendChild(div);
+      div.scrollIntoView({ block: 'end' });
+      return div;
+    }
+
     async function send() {
       const text = input.value.trim();
       if (!text) return;
       input.value = '';
-      input.style.height = '42px';
+      input.style.height = '40px';
       sendBtn.disabled = true;
 
       addMsg(text, 'user');
-      const typing = addMsg('Thinking…', 'typing');
+      const typing = addTyping();
 
       try {
         const resp = await fetch('/chat/message', {
@@ -785,7 +1012,7 @@ CHAT_HTML = """<!DOCTYPE html>
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
     input.addEventListener('input', () => {
-      input.style.height = '42px';
+      input.style.height = '40px';
       input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     });
 
@@ -793,23 +1020,29 @@ CHAT_HTML = """<!DOCTYPE html>
     fetch('/chat/status')
       .then(r => r.json())
       .then(data => {
-        if (!data.authenticated) return;
+        if (!data.authenticated) {
+          // Show "Connect Strava" state instead of phone form
+          phoneScreen.classList.remove('active');
+          connectScreen.style.display = 'flex';
+          connectScreen.classList.add('active');
+          return;
+        }
         phoneScreen.classList.remove('active');
         chatScreen.style.display = 'flex';
         sendBtn.disabled = true;
         input.disabled = true;
-        const loadingMsg = addMsg('Coach Claude is reviewing your data\u2026', 'typing');
+        const loadingTyping = addTyping();
         fetch('/chat/init')
           .then(r => r.json())
           .then(initData => {
-            loadingMsg.remove();
+            loadingTyping.remove();
             addMsg(initData.greeting || 'Hey! I\\'m Coach Claude. How can I help?', 'coach');
             sendBtn.disabled = false;
             input.disabled = false;
             input.focus();
           })
           .catch(() => {
-            loadingMsg.remove();
+            loadingTyping.remove();
             addMsg('Hey! I\\'m Coach Claude. How can I help?', 'coach');
             sendBtn.disabled = false;
             input.disabled = false;
@@ -831,6 +1064,8 @@ def chat_ui():
 def chat_auth():
     phone = request.args.get("phone", "").strip()
     name = request.args.get("name", "").strip()
+    if _normalize_phone(phone) not in ALLOWED_PHONES:
+        return _PRIVATE_BETA_HTML, 403, {"Content-Type": "text/html"}
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
     state_payload = {"phone": phone, "source": "chat"}
     if name:
@@ -839,38 +1074,100 @@ def chat_auth():
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
 
 
-_INTEGRATIONS_HTML = """<!DOCTYPE html>
+def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connected: bool) -> str:
+    """Render the unified onboarding / connect-your-data page."""
+
+    # Strava tile button — when not connected, show an inline form for phone+name
+    if strava_connected:
+        strava_btn = '<span class="connect-btn connected">Connected &#10003;</span>'
+        strava_extra = ""
+    else:
+        strava_btn = ""  # rendered inside the form below
+        strava_extra = ""
+
+    # Garmin tile button
+    if garmin_connected:
+        garmin_btn = '<span class="connect-btn connected">Connected &#10003;</span>'
+    elif strava_connected:
+        garmin_btn = '<a href="/garmin/auth" class="connect-btn">Connect</a>'
+    else:
+        garmin_btn = '<span class="connect-btn disabled">Connect Strava first</span>'
+
+    # TrainingPeaks tile button
+    if tp_connected:
+        tp_btn = '<span class="connect-btn connected">Connected &#10003;</span>'
+    elif strava_connected:
+        tp_btn = '<a href="/tp/auth" class="connect-btn">Connect</a>'
+    else:
+        tp_btn = '<span class="connect-btn disabled">Connect Strava first</span>'
+
+    # Bottom action
+    if strava_connected:
+        bottom_action = '<a href="/chat" class="start-btn">Start chatting &#8594;</a>'
+    else:
+        bottom_action = ""
+
+    strava_tile_class = "tile tile-primary tile-done" if strava_connected else "tile tile-primary"
+
+    # When Strava isn't connected yet, render the tile with an inline phone+name form
+    if strava_connected:
+        strava_tile_content = f"""
+      <div class="{strava_tile_class}">
+        <div class="tile-icon strava">S</div>
+        <div class="tile-info">
+          <div class="tile-name">Strava <span class="tile-badge">Needed for rides</span></div>
+          <div class="tile-desc">Analyse your outdoor rides and calculate aerodynamic CdA after every upload.</div>
+        </div>
+        {strava_btn}
+      </div>"""
+    else:
+        strava_tile_content = f"""
+      <div class="{strava_tile_class}">
+        <div class="tile-icon strava">S</div>
+        <div class="tile-info">
+          <div class="tile-name">Strava <span class="tile-badge">Needed for rides</span></div>
+          <div class="tile-desc">Analyse your outdoor rides and calculate aerodynamic CdA after every upload.</div>
+          <div class="inline-form" id="strava-form">
+            <input id="ob-name" type="text" placeholder="Your name" autocomplete="name" />
+            <input id="ob-phone" type="tel" placeholder="Phone (e.g. +16035317244)" autocomplete="tel" />
+            <div id="ob-error" class="form-error"></div>
+            <a id="strava-connect-btn" class="connect-btn strava-connect" onclick="return connectStrava()">Connect Strava</a>
+          </div>
+        </div>
+      </div>"""
+
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Coach Claude — Connect your data</title>
+  <title>Coach Claude &mdash; Connect your data</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
-    body {
+    body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
       background: #0a0a0a;
       color: #f0f0f0;
       min-height: 100dvh;
       display: flex;
       flex-direction: column;
-    }
+    }}
 
-    header {
+    header {{
       padding: 1rem 1.5rem;
       border-bottom: 1px solid #1e1e1e;
       display: flex;
       align-items: center;
       gap: 0.75rem;
-    }
-    header .logo { font-weight: 800; font-size: 1.1rem; color: #fff; }
-    header .dot {
+    }}
+    header .logo {{ font-weight: 800; font-size: 1.1rem; color: #fff; }}
+    header .dot {{
       width: 8px; height: 8px; border-radius: 50%;
       background: #4ade80; flex-shrink: 0;
-    }
+    }}
 
-    main {
+    main {{
       flex: 1;
       display: flex;
       flex-direction: column;
@@ -880,20 +1177,20 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
       max-width: 480px;
       margin: 0 auto;
       width: 100%;
-    }
+    }}
 
-    .heading { text-align: center; }
-    .heading h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }
-    .heading p { color: #888; line-height: 1.6; font-size: 0.95rem; }
+    .heading {{ text-align: center; }}
+    .heading h2 {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }}
+    .heading p {{ color: #888; line-height: 1.6; font-size: 0.95rem; }}
 
-    .tiles {
+    .tiles {{
       display: flex;
       flex-direction: column;
       gap: 0.75rem;
       width: 100%;
-    }
+    }}
 
-    .tile {
+    .tile {{
       background: #1a1a1a;
       border: 1px solid #2a2a2a;
       border-radius: 12px;
@@ -901,9 +1198,19 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 1rem;
-    }
+    }}
 
-    .tile-icon {
+    /* Strava tile gets a subtle highlight to signal it is the primary one */
+    .tile.tile-primary {{
+      border-color: #fc4c02;
+      background: #1f1510;
+    }}
+    .tile.tile-primary.tile-done {{
+      border-color: #2a3d2a;
+      background: #111a11;
+    }}
+
+    .tile-icon {{
       width: 44px;
       height: 44px;
       border-radius: 10px;
@@ -913,16 +1220,30 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
       justify-content: center;
       font-size: 1.3rem;
       font-weight: 800;
-    }
-    .tile-icon.garmin  { background: #0066cc; color: #fff; }
-    .tile-icon.tp      { background: #e87722; color: #fff; }
-    .tile-icon.apple   { background: #2a2a2a; color: #aaa; }
+    }}
+    .tile-icon.strava  {{ background: #fc4c02; color: #fff; }}
+    .tile-icon.garmin  {{ background: #0066cc; color: #fff; }}
+    .tile-icon.tp      {{ background: #e87722; color: #fff; }}
+    .tile-icon.apple   {{ background: #2a2a2a; color: #aaa; }}
 
-    .tile-info { flex: 1; min-width: 0; }
-    .tile-info .tile-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
-    .tile-info .tile-desc { font-size: 0.8rem; color: #777; line-height: 1.4; }
+    .tile-info {{ flex: 1; min-width: 0; }}
+    .tile-info .tile-name {{ font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }}
+    .tile-info .tile-desc {{ font-size: 0.8rem; color: #777; line-height: 1.4; }}
+    .tile-badge {{
+      display: inline-block;
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      background: #fc4c02;
+      color: #fff;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      margin-left: 0.4rem;
+      vertical-align: middle;
+    }}
 
-    .connect-btn {
+    .connect-btn {{
       background: #4ade80;
       color: #0a0a0a;
       border: none;
@@ -935,23 +1256,77 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
       white-space: nowrap;
       transition: opacity 0.15s;
       flex-shrink: 0;
-    }
-    .connect-btn:hover { opacity: 0.85; }
-    .connect-btn.disabled {
+    }}
+    .connect-btn:hover {{ opacity: 0.85; }}
+    .connect-btn.strava-connect {{
+      background: #fc4c02;
+      color: #fff;
+    }}
+    .connect-btn.disabled {{
       background: #2a2a2a;
       color: #555;
       cursor: default;
       pointer-events: none;
-    }
+    }}
+    .connect-btn.connected {{
+      background: transparent;
+      color: #4ade80;
+      border: 1px solid #2a3d2a;
+      cursor: default;
+      pointer-events: none;
+    }}
 
-    .skip-link {
+    .start-btn {{
+      background: #4ade80;
+      color: #0a0a0a;
+      border: none;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.95rem;
+      padding: 0.75rem 2rem;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.15s;
+      width: 100%;
+      max-width: 340px;
+      text-align: center;
+      display: inline-block;
+    }}
+    .start-btn:hover {{ opacity: 0.85; }}
+
+    .skip-link {{
       color: #555;
       font-size: 0.88rem;
       text-decoration: none;
       margin-top: 0.5rem;
       transition: color 0.15s;
-    }
-    .skip-link:hover { color: #888; }
+    }}
+    .skip-link:hover {{ color: #888; }}
+
+    .inline-form {{
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }}
+    .inline-form input {{
+      background: #0a0a0a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #f0f0f0;
+      font-size: 0.88rem;
+      padding: 0.55rem 0.85rem;
+      font-family: inherit;
+      outline: none;
+      width: 100%;
+    }}
+    .inline-form input:focus {{ border-color: #555; }}
+    .inline-form input::placeholder {{ color: #444; }}
+    .form-error {{
+      font-size: 0.8rem;
+      color: #f87171;
+      min-height: 1em;
+    }}
   </style>
 </head>
 <body>
@@ -962,11 +1337,14 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
 
   <main>
     <div class="heading">
-      <h2>Connect your data sources</h2>
-      <p>Strava is connected. Optionally link additional sources for richer analysis.</p>
+      <h2>Connect what you use</h2>
+      <p>All sources are optional, but Strava is needed for ride analysis and CdA calculations.</p>
     </div>
 
     <div class="tiles">
+
+      <!-- Strava -->
+      {strava_tile_content}
 
       <!-- Garmin -->
       <div class="tile">
@@ -975,7 +1353,7 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
           <div class="tile-name">Garmin Connect</div>
           <div class="tile-desc">Sync heart rate, power, and fitness metrics from your Garmin device.</div>
         </div>
-        <a href="/garmin/auth" class="connect-btn">Connect</a>
+        {garmin_btn}
       </div>
 
       <!-- TrainingPeaks -->
@@ -985,7 +1363,7 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
           <div class="tile-name">TrainingPeaks</div>
           <div class="tile-desc">Import your structured training plans and TSS/ATL/CTL data.</div>
         </div>
-        <a href="/tp/auth" class="connect-btn">Connect</a>
+        {tp_btn}
       </div>
 
       <!-- Apple Health -->
@@ -993,23 +1371,62 @@ _INTEGRATIONS_HTML = """<!DOCTYPE html>
         <div class="tile-icon apple">&#xf8ff;</div>
         <div class="tile-info">
           <div class="tile-name">Apple Health</div>
-          <div class="tile-desc">Available on the iOS app — sync sleep, HRV, and activity data.</div>
+          <div class="tile-desc">Available on the iOS app &mdash; sync sleep, HRV, and activity data.</div>
         </div>
         <span class="connect-btn disabled">iOS only</span>
       </div>
 
     </div>
 
-    <a href="/chat" class="skip-link">Skip for now &rarr;</a>
+    {bottom_action}
   </main>
+
+  <script>
+    function normalizePhone(raw) {{
+      const digits = raw.replace(/\\D/g, '');
+      if (digits.length === 10) return '+1' + digits;
+      if (digits.length === 11 && digits[0] === '1') return '+' + digits;
+      return '+' + digits;
+    }}
+
+    function connectStrava() {{
+      const name = (document.getElementById('ob-name')?.value || '').trim();
+      const rawPhone = (document.getElementById('ob-phone')?.value || '').trim();
+      const err = document.getElementById('ob-error');
+      if (!rawPhone) {{ if (err) err.textContent = 'Phone number is required.'; return false; }}
+      const phone = normalizePhone(rawPhone);
+      if (err) err.textContent = '';
+      const params = new URLSearchParams({{ phone }});
+      if (name) params.set('name', name);
+      window.location.href = '/chat/auth?' + params.toString();
+      return false;
+    }}
+  </script>
 </body>
-</html>
-"""
+</html>"""
+
+
+@app.route("/onboarding")
+def onboarding():
+    athlete_id = session.get("athlete_id")
+    strava_connected = bool(athlete_id)
+    garmin_connected = False
+    tp_connected = False
+    if athlete_id:
+        try:
+            integrations_data = db.get_user_integrations(athlete_id)
+            garmin_connected = "garmin" in integrations_data
+            tp_connected = "trainingpeaks" in integrations_data
+        except Exception:
+            log.warning("Could not fetch integrations for athlete %d", athlete_id)
+    html = _render_onboarding(strava_connected, garmin_connected, tp_connected)
+    return html, 200, {"Content-Type": "text/html"}
 
 
 @app.route("/onboarding/integrations")
 def onboarding_integrations():
-    return _INTEGRATIONS_HTML, 200, {"Content-Type": "text/html"}
+    public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+    return redirect(f"{public_url}/onboarding")
 
 
 @app.route("/chat/status")
@@ -1070,9 +1487,18 @@ _CLAUDE_TOOLS = [
     {
         "name": "get_athlete_profile",
         "description": (
-            "Fetch the user's profile: full name, stored rider+bike weight, Strava FTP if set, "
-            "location, and any connected integrations (Garmin, TrainingPeaks). Use this to "
-            "personalise coaching responses and to check whether weight is set."
+            "Fetch live, up-to-date athlete data from Strava including current FTP and account "
+            "details. Use this when you need fresh data beyond what's in the athlete profile "
+            "summary."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_training_history",
+        "description": (
+            "Get the athlete's stored training history profile: weekly volume, sport mix, "
+            "training consistency, FTP estimate, and key observations from the last 90 days "
+            "across all connected sources."
         ),
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
@@ -1115,58 +1541,104 @@ _CLAUDE_TOOLS = [
 ]
 
 _SYSTEM_PROMPT = """\
-You are Coach Claude, an expert AI cycling performance coach with deep knowledge of \
-aerodynamics, training physiology, and power-based training. You help cyclists understand \
-and improve their performance by analysing their Strava ride data.
+You are Coach Claude — a cycling performance coach with deep expertise in aerodynamics, \
+training physiology, and power-based training. You've seen a lot of athletes. You know how \
+to read the numbers and tell someone what actually matters.
 
-## Your expertise
+You don't ask for information you already have. You don't recite data back verbatim. When \
+an athlete asks a question, you think about what you know about them first, then give a \
+direct, specific answer. Match their energy — if they're asking a quick question, be concise. \
+If they want to go deep, go deep.
 
-**Aerodynamics & CdA**
-CdA (coefficient of drag area, m²) quantifies aerodynamic drag — it is the product of \
-drag coefficient (Cd) and frontal area (A). Lower CdA = less drag = faster at the same power.
+## Aerodynamics & CdA
 
-Typical CdA values by position:
-• 0.20–0.25 m² — aggressive TT / triathlon position (full tuck, aero helmet, skinsuit)
-• 0.25–0.28 m² — road race aero position (drops, tight kit, elbows in)
-• 0.28–0.32 m² — road bike in the drops, relaxed
-• 0.32–0.38 m² — road bike on the hoods
-• 0.38–0.50 m² — upright / commuter position
+CdA (coefficient of drag area, m²) is the product of drag coefficient and frontal area. \
+Lower CdA means less drag and more speed for the same power output.
 
-A 0.01 m² CdA reduction saves ~6–8 watts at 40 km/h — meaningful in any race or time trial.
+Typical CdA benchmarks by position:
+  0.20–0.25 m² — aggressive TT / triathlon (full tuck, aero helmet, skinsuit)
+  0.25–0.28 m² — road aero position (drops, tight kit, elbows in)
+  0.28–0.32 m² — road bike in the drops, relaxed
+  0.32–0.38 m² — road bike on the hoods
+  0.38–0.50 m² — upright / commuter position
 
-**Power-based training zones** (based on FTP)
-• Zone 1 Recovery: <55% FTP
-• Zone 2 Endurance: 56–75% FTP
-• Zone 3 Tempo: 76–90% FTP
-• Zone 4 Threshold: 91–105% FTP
-• Zone 5 VO2max: 106–120% FTP
-• Zone 6 Anaerobic: >121% FTP
+A 0.01 m² CdA reduction saves roughly 6–8 watts at 40 km/h — significant in any race or TT.
 
-**Key improvement levers**
-1. Position changes — lower torso, narrower arms, aero helmet (highest impact)
-2. Equipment — aero wheels, skinsuit, aero frame
-3. Consistency — CdA varies ride to ride; track trends, not isolated measurements
-4. Combined weight — lighter system reduces rolling resistance and gravity penalty
+Strava-derived CdA carries about 5% uncertainty. Differences under 0.005 m² between rides \
+are within measurement noise. Focus on 5+ ride trends, not single sessions. A climb-heavy \
+ride can inflate CdA because the athlete sits up on steep grades — always contextualise.
+
+## Power-based training zones (based on FTP)
+
+  Z1 Recovery: <55%    Z2 Endurance: 56–75%    Z3 Tempo: 76–90%
+  Z4 Threshold: 91–105%    Z5 VO2max: 106–120%    Z6 Anaerobic: >121%
+
+## Key improvement levers
+
+Position changes (lower torso, narrower arms, aero helmet) have the highest single-session \
+impact. Equipment — aero wheels, skinsuit, aero frame — comes next. Consistency of position \
+across rides matters more than any one change. Combined rider + bike weight reduces rolling \
+resistance and climbing penalty.
 
 ## How you operate
 
-- When a user asks about performance, recent rides, CdA, or training — use your tools \
-immediately. Do not ask unnecessary clarifying questions before fetching data.
-- Give actionable, specific advice. Avoid generic platitudes like "ride more" or "train hard".
-- Benchmark every CdA result against the typical ranges above. Tell the user what their \
-number means in plain English.
-- When you have multiple rides, spot trends. Is CdA improving? Are there outlier sessions?
-- CdA from Strava streams has ~5% uncertainty, so differences <0.005 m² between rides are \
-within noise. Focus on trends over 5+ rides.
-- High CdA on a climb-heavy ride can reflect sitting up on steep grades — note this.
-- If the user has no weight stored, ask politely and explain it is required for the physics \
-model. Do not attempt CdA calculations without it.
-- When the conversation starts, proactively fetch the athlete profile and recent rides to \
-introduce yourself with personalised context.
-- Be encouraging but honest. If CdA is high, say so plainly and explain what would help.\
+Use your tools immediately when the athlete asks about rides, CdA, or training — don't ask \
+clarifying questions before fetching data. Give actionable, specific advice. Benchmark every \
+CdA result against the ranges above and say what it means in plain English. Be honest: if \
+CdA is high or training load is low, say so and explain what would help. Be encouraging \
+where it's warranted, not reflexively. If the user has no weight stored, ask politely — \
+it is required for all CdA calculations.\
 """
 
 _MAX_HISTORY = 20  # max messages to keep in session
+
+
+def _build_system_prompt(profile: dict | None = None) -> str:
+    """Return the system prompt, extended with the athlete's profile when available."""
+    if not profile:
+        return _SYSTEM_PROMPT
+
+    # Format sport mix
+    sport_mix = profile.get("sport_mix") or {}
+    sport_mix_str = (
+        ", ".join(f"{sport}: {pct:.0f}%" for sport, pct in sport_mix.items())
+        if sport_mix else "not available"
+    )
+
+    # Format notes
+    notes = profile.get("notes") or []
+    notes_str = (
+        "\n".join(f"- {n}" for n in notes)
+        if notes else "- No specific observations recorded"
+    )
+
+    # Format data sources
+    sources = profile.get("sources") or []
+    sources_str = ", ".join(sources) if sources else "Strava"
+
+    # FTP
+    ftp = profile.get("ftp")
+    ftp_str = f"{ftp} W" if ftp else "not available"
+
+    athlete_section = (
+        f"\n\n## Your athlete\n"
+        f"Name: {profile.get('name', 'Unknown')}\n"
+        f"Primary sport: {profile.get('primary_sport', 'cycling')}\n"
+        f"Training consistency: {profile.get('consistency', 'unknown')} "
+        f"({profile.get('weekly_hours_avg', 0):.1f} hrs/wk avg over last 90 days)\n"
+        f"Weekly rides: {profile.get('weekly_rides_avg', 0):.1f} avg\n"
+        f"FTP estimate: {ftp_str}\n"
+        f"Sport mix (last 90 days): {sport_mix_str}\n"
+        f"Longest ride: {profile.get('longest_ride_km', 0):.0f} km\n"
+        f"Notes:\n{notes_str}\n"
+        f"Data sources: {sources_str}\n"
+        f"Profile last updated: {profile.get('built_at', 'unknown')}\n"
+        f"\nUse this profile to reason about their current fitness, fatigue, and goals "
+        f"throughout the entire conversation. Reference it naturally — don't recite it back "
+        f"verbatim. When they ask about training, you already know their baseline."
+    )
+
+    return _SYSTEM_PROMPT + athlete_section
 
 
 # ---------------------------------------------------------------------------
@@ -1465,6 +1937,40 @@ def _execute_claude_tool(name: str, tool_input: dict, user: dict) -> str:
             log.error("get_cda_history tool error:\n%s", traceback.format_exc())
             return "Error calculating CdA history."
 
+    # ------------------------------------------------------------------ #
+    #  get_training_history                                                #
+    # ------------------------------------------------------------------ #
+    if name == "get_training_history":
+        profile = db.get_athlete_profile(user["athlete_id"])
+        if profile is None:
+            return "No training history profile built yet."
+        sport_mix = profile.get("sport_mix", {})
+        sport_mix_str = (
+            ", ".join(f"{sport}: {count}" for sport, count in sport_mix.items()) or "N/A"
+        )
+        sources_str = ", ".join(profile.get("sources", [])) or "N/A"
+        notes_list = profile.get("notes", [])
+        notes_str = "\n".join(f"- {n}" for n in notes_list) if notes_list else "- None"
+        avg_power = profile.get("avg_power_watts")
+        avg_power_str = f"{avg_power} W" if avg_power else "N/A"
+        ftp = profile.get("ftp_estimate")
+        ftp_str = f"{ftp} W" if ftp else "N/A"
+        built_at = (profile.get("built_at") or "")[:10] or "unknown"
+        lines = [
+            f"Training history profile (built {built_at}, sources: {sources_str}):",
+            f"Primary sport: {profile.get('primary_sport', 'N/A')}",
+            f"Sport mix (last 90 days): {sport_mix_str}",
+            f"Weekly training hours (avg): {profile.get('weekly_hours_avg', 0):.1f} h",
+            f"Weekly rides (avg): {profile.get('weekly_rides_avg', 0):.1f}",
+            f"Longest ride: {profile.get('longest_ride_km', 0):.1f} km",
+            f"Total elevation (90 days): {profile.get('total_elevation_90d', 0)} m",
+            f"Avg power (rides): {avg_power_str}",
+            f"FTP estimate: {ftp_str}",
+            f"Training consistency: {profile.get('training_consistency', 'N/A')}",
+            f"Key observations:\n{notes_str}",
+        ]
+        return "\n".join(lines)
+
     return f"Unknown tool: {name}"
 
 
@@ -1472,19 +1978,45 @@ def _execute_claude_tool(name: str, tool_input: dict, user: dict) -> str:
 # Core Claude agent loop
 # ---------------------------------------------------------------------------
 
-def _run_claude_agent(user: dict, messages: list, max_tokens: int = 1024) -> tuple:
+_PROFILE_NOT_SET = object()  # sentinel for "profile not yet fetched"
+
+
+def _run_claude_agent(
+    user: dict,
+    messages: list,
+    max_tokens: int = 1024,
+    athlete_profile=_PROFILE_NOT_SET,
+) -> tuple:
     """
     Run the Claude agent loop with tool use until end_turn.
     `messages` is a list of Anthropic-format dicts (modified in-place).
     Returns (reply_text, messages).
+
+    If athlete_profile is not explicitly passed, it is loaded from Firestore so
+    that the system prompt always contains the athlete's current training context.
+    Pass athlete_profile=None explicitly to skip the DB load (e.g. when the caller
+    has already confirmed no profile exists).
     """
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    # Load profile from DB only when it hasn't been supplied by the caller
+    if athlete_profile is _PROFILE_NOT_SET:
+        try:
+            athlete_profile = db.get_athlete_profile(user["athlete_id"])
+        except Exception:
+            log.warning(
+                "Could not load athlete profile for %d — using base system prompt",
+                user["athlete_id"],
+            )
+            athlete_profile = None
+
+    system_prompt = _build_system_prompt(athlete_profile)
 
     while True:
         with client.messages.stream(
             model="claude-opus-4-6",
             max_tokens=max_tokens,
-            system=_SYSTEM_PROMPT,
+            system=system_prompt,
             tools=_CLAUDE_TOOLS,
             messages=messages,
         ) as stream:
@@ -1514,14 +2046,14 @@ def _run_claude_agent(user: dict, messages: list, max_tokens: int = 1024) -> tup
     return "Something went wrong. Please try again.", messages
 
 
-def _chat_with_claude(user: dict, text: str, history: list) -> tuple:
+def _chat_with_claude(user: dict, text: str, history: list, max_tokens: int = 1024) -> tuple:
     """
     Run one user turn through the Claude agent.
     Returns (reply_text, updated_history).
     history contains simple {"role": ..., "content": str} dicts for session storage.
     """
     messages = list(history) + [{"role": "user", "content": text}]
-    reply, _ = _run_claude_agent(user, messages)
+    reply, _ = _run_claude_agent(user, messages, max_tokens=max_tokens)
 
     # Persist only simple text turns in session history (keeps session size manageable)
     new_history = (history + [
@@ -1552,20 +2084,41 @@ def chat_init():
         return jsonify({"greeting": cached})
 
     log.info("Generating personalised greeting for athlete %d", athlete_id)
+    first_name = (session.get("athlete_name") or user.get("name") or "").split()[0] or "there"
+
+    # Try to load the athlete's training profile — if present, use it in the system prompt
+    # and write a greeting that references it directly (no tool calls needed).
     try:
-        # Build a minimal context message that asks Claude to introduce itself
-        first_name = (session.get("athlete_name") or user.get("name") or "").split()[0] or "there"
-        init_prompt = (
-            f"The user {first_name} has just opened the Coach Claude chat. "
-            "Fetch their athlete profile and recent rides using your tools, then write a "
-            "short, warm, personalised opening message (2–4 sentences). "
-            "Mention their name, note something specific from their recent rides if available "
-            "(e.g. last ride name or how many rides this week), and offer a concrete next step "
-            "like calculating CdA for a specific ride. Be direct and friendly — no generic "
-            "platitudes. Do not use markdown headers or bullet lists in this greeting."
-        )
+        profile = db.get_athlete_profile(athlete_id)
+    except Exception:
+        log.warning("chat_init: could not load profile for athlete %d", athlete_id)
+        profile = None
+
+    try:
+        if profile:
+            init_prompt = (
+                f"{first_name} just opened the chat. You've already reviewed their profile above. "
+                "Write a short, warm opening message (2–4 sentences) that: "
+                "greets them by first name; references something SPECIFIC from their training "
+                "profile (e.g. their consistency level, a recent long ride, their FTP, their "
+                "primary sport and volume); offers one concrete, personalised next step based on "
+                "what you know; and sounds like a coach who's been thinking about their training, "
+                "not a chatbot asking for data. "
+                "No markdown headers or bullet lists. Be direct and human."
+            )
+        else:
+            init_prompt = (
+                f"The user {first_name} has just opened the Coach Claude chat. "
+                "Fetch their athlete profile and recent rides using your tools, then write a "
+                "short, warm, personalised opening message (2–4 sentences). "
+                "Mention their name, note something specific from their recent rides if available "
+                "(e.g. last ride name or how many rides this week), and offer a concrete next step "
+                "like calculating CdA for a specific ride. Be direct and friendly — no generic "
+                "platitudes. Do not use markdown headers or bullet lists in this greeting."
+            )
+
         messages = [{"role": "user", "content": init_prompt}]
-        greeting, _ = _run_claude_agent(user, messages, max_tokens=512)
+        greeting, _ = _run_claude_agent(user, messages, max_tokens=512, athlete_profile=profile)
         session["chat_greeting"] = greeting
         # Seed chat history with the greeting so context is preserved
         session["chat_history"] = [{"role": "assistant", "content": greeting}]
@@ -1575,7 +2128,6 @@ def chat_init():
             "chat_init error for athlete %d:\n%s", athlete_id, traceback.format_exc()
         )
         # Fall back to a simple static greeting
-        first_name = (session.get("athlete_name") or "").split()[0] or "there"
         fallback = (
             f"Hey {first_name}! I'm Coach Claude, your cycling performance coach. "
             "Ask me to calculate your CdA, review your recent rides, or analyse your aerodynamics."
@@ -1609,6 +2161,38 @@ def chat_message():
         reply = "Something went wrong — please try again."
 
     return jsonify({"reply": reply})
+
+
+# ---------------------------------------------------------------------------
+# Profile refresh endpoint
+# ---------------------------------------------------------------------------
+
+@app.route("/chat/profile/refresh", methods=["POST"])
+def chat_profile_refresh():
+    """Trigger a background rebuild of the athlete profile. Returns immediately."""
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"error": "Not authenticated"}), 401
+    user = db.get_user_by_athlete(athlete_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 401
+    threading.Thread(target=_safe_build_profile, args=(user,), daemon=True).start()
+    return jsonify({"status": "refreshing"})
+
+
+# ---------------------------------------------------------------------------
+# Privacy policy — required URL for Twilio A2P 10DLC campaign registration
+# ---------------------------------------------------------------------------
+
+@app.route("/privacy")
+def privacy():
+    return (
+        "<h1>Privacy Policy</h1>"
+        "<p>Coach Claude collects your phone number and Strava activity data solely to deliver "
+        "cycling performance analysis via SMS. Your data is not sold or shared with third parties. "
+        "To stop receiving messages, reply STOP to any SMS. "
+        "Contact: nikliolios@irlll.com</p>"
+    ), 200, {"Content-Type": "text/html"}
 
 
 # ---------------------------------------------------------------------------
