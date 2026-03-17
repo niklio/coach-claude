@@ -3,11 +3,13 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import traceback
 import urllib.parse
 
 import anthropic
+import requests as _requests_lib
 from dotenv import load_dotenv
 from flask import Flask, jsonify, redirect, request, session
 from twilio.twiml.messaging_response import MessagingResponse
@@ -32,6 +34,9 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me")
 
+ADMIN_EMAIL = "nikliolios@irlll.com"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1604,6 +1609,173 @@ def chat_message():
         reply = "Something went wrong — please try again."
 
     return jsonify({"reply": reply})
+
+
+# ---------------------------------------------------------------------------
+# Admin dashboard — Google OAuth protected
+# ---------------------------------------------------------------------------
+
+@app.route("/admin")
+def admin():
+    if session.get("admin_email") != ADMIN_EMAIL:
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        state = secrets.token_urlsafe(16)
+        session["admin_oauth_state"] = state
+        params = urllib.parse.urlencode({
+            "client_id": GOOGLE_CLIENT_ID,
+            "redirect_uri": f"{public_url}/admin/callback",
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+        })
+        return redirect(f"https://accounts.google.com/o/oauth2/v2/auth?{params}")
+
+    users = db.get_all_users()
+    users.sort(key=lambda u: u.get("name", "").lower())
+
+    user_cards = ""
+    for u in users:
+        athlete_id = u.get("athlete_id", "")
+        name = u.get("name") or "(no name)"
+        phone = u.get("phone_number") or "(no phone)"
+        weight = f"{u['weight_kg']} kg" if u.get("weight_kg") else "(not set)"
+        awaiting = "yes" if u.get("awaiting_weight") else "no"
+        integrations_data = u.get("integrations", {})
+        int_list = ", ".join(k for k, v in integrations_data.items() if v) or "none" if integrations_data else "none"
+
+        user_cards += f"""
+        <div class="athlete-card">
+          <div class="athlete-header">
+            <span class="athlete-name">{name}</span>
+            <span class="athlete-id">#{athlete_id}</span>
+          </div>
+          <div class="athlete-fields">
+            <div class="field"><span class="label">Phone</span><span class="value">{phone}</span></div>
+            <div class="field"><span class="label">Weight</span><span class="value">{weight}</span></div>
+            <div class="field"><span class="label">Awaiting weight</span><span class="value">{awaiting}</span></div>
+            <div class="field"><span class="label">Integrations</span><span class="value">{int_list}</span></div>
+          </div>
+        </div>
+        """
+
+    total = len(users)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude \u2014 Admin</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a;
+      color: #f0f0f0;
+      min-height: 100vh;
+      padding: 2rem;
+    }}
+    header {{
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 2rem;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid #1e1e1e;
+    }}
+    header .dot {{ width: 8px; height: 8px; border-radius: 50%; background: #4ade80; flex-shrink: 0; }}
+    header h1 {{ font-size: 1.2rem; font-weight: 800; color: #fff; }}
+    header .subtitle {{ color: #888; font-size: 0.85rem; margin-left: auto; }}
+    .stats {{ margin-bottom: 1.5rem; color: #4ade80; font-size: 0.9rem; font-weight: 600; }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1rem;
+    }}
+    .athlete-card {{
+      background: #111;
+      border: 1px solid #1e1e1e;
+      border-radius: 10px;
+      padding: 1.25rem;
+    }}
+    .athlete-header {{
+      display: flex;
+      align-items: baseline;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }}
+    .athlete-name {{ font-weight: 700; font-size: 1rem; color: #fff; }}
+    .athlete-id {{ color: #555; font-size: 0.8rem; }}
+    .athlete-fields {{ display: flex; flex-direction: column; gap: 0.4rem; }}
+    .field {{ display: flex; gap: 0.5rem; font-size: 0.85rem; }}
+    .label {{ color: #666; min-width: 130px; flex-shrink: 0; }}
+    .value {{ color: #ccc; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="dot"></div>
+    <h1>Coach Claude \u2014 Admin</h1>
+    <span class="subtitle">Signed in as {session.get("admin_email")}</span>
+  </header>
+  <div class="stats">{total} registered athlete{"" if total == 1 else "s"}</div>
+  <div class="grid">
+    {user_cards}
+  </div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/admin/callback")
+def admin_callback():
+    code = request.args.get("code")
+    state = request.args.get("state", "")
+    error = request.args.get("error")
+
+    if error or not code:
+        return f"Google OAuth failed: {error or 'no code'}", 400
+
+    if state != session.pop("admin_oauth_state", None):
+        return "Invalid OAuth state.", 400
+
+    public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+    redirect_uri = f"{public_url}/admin/callback"
+
+    token_resp = _requests_lib.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        },
+        timeout=10,
+    )
+    if not token_resp.ok:
+        log.error("Google token exchange failed: %s", token_resp.text)
+        return "Google token exchange failed.", 500
+
+    access_token = token_resp.json().get("access_token")
+    if not access_token:
+        return "No access token returned by Google.", 500
+
+    userinfo_resp = _requests_lib.get(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+    if not userinfo_resp.ok:
+        return "Failed to fetch Google user info.", 500
+
+    email = userinfo_resp.json().get("email", "")
+    if email != ADMIN_EMAIL:
+        log.warning("Admin login attempt from unauthorized email: %s", email)
+        return "Access denied.", 403
+
+    session["admin_email"] = email
+    log.info("Admin login: %s", email)
+    return redirect(f"{public_url}/admin")
 
 
 # ---------------------------------------------------------------------------

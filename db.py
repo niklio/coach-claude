@@ -98,3 +98,8 @@ def remove_integration(athlete_id: int, integration: str) -> None:
 
 def user_count() -> int:
     return sum(1 for _ in _db.collection(_USERS).list_documents())
+
+
+def get_all_users() -> list:
+    """Return all user documents from Firestore."""
+    return [doc.to_dict() for doc in _db.collection(_USERS).stream() if doc.exists]
