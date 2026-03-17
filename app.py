@@ -2,9 +2,11 @@ import base64
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import threading
+import time
 import traceback
 import urllib.parse
 
@@ -453,6 +455,7 @@ def oauth_callback():
         return f"OAuth failed: {e}", 500
 
 
+
 # ---------------------------------------------------------------------------
 # Garmin OAuth
 # ---------------------------------------------------------------------------
@@ -641,7 +644,30 @@ CHAT_HTML = """<!DOCTYPE html>
       gap: 0.6rem;
       background: #0d0d0d;
       flex-shrink: 0;
+      justify-content: space-between;
     }
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+    }
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+    .icon-btn {
+      background: none;
+      border: none;
+      color: #555;
+      font-size: 1rem;
+      cursor: pointer;
+      padding: 0.4rem;
+      border-radius: 6px;
+      transition: color 0.15s, background 0.15s;
+      line-height: 1;
+    }
+    .icon-btn:hover { color: #ccc; background: #1a1a1a; }
     header .logo {
       font-weight: 700;
       font-size: 0.95rem;
@@ -733,6 +759,33 @@ CHAT_HTML = """<!DOCTYPE html>
       max-width: 300px;
     }
     .strava-btn:hover { opacity: 0.85; }
+
+    .connect-options {
+      display: flex;
+      gap: 0.75rem;
+      width: 100%;
+      max-width: 300px;
+    }
+    .connect-options .primary-btn {
+      flex: 1;
+    }
+    .outline-btn {
+      flex: 1;
+      background: transparent;
+      color: #f0f0f0;
+      border: 1px solid #333;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.75rem 1rem;
+      cursor: pointer;
+      text-decoration: none;
+      transition: border-color 0.15s, color 0.15s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .outline-btn:hover { border-color: #555; color: #fff; }
 
     /* --- chat --- */
     #chat-screen {
@@ -865,20 +918,77 @@ CHAT_HTML = """<!DOCTYPE html>
       padding: 0.35rem 0 0.25rem;
       letter-spacing: 0.02em;
     }
+    #settings-panel { position: fixed; inset: 0; z-index: 100; }
+    #settings-overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.5); }
+    #settings-drawer {
+      position: absolute; right: 0; top: 0; bottom: 0;
+      width: min(320px, 90vw);
+      background: #111; border-left: 1px solid #222;
+      display: flex; flex-direction: column;
+    }
+    .drawer-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 1rem 1.25rem; border-bottom: 1px solid #1e1e1e;
+      font-weight: 600; font-size: 0.95rem;
+    }
+    .drawer-body { padding: 1.25rem; display: flex; flex-direction: column; gap: 1.25rem; }
+    .setting-row label { display: block; font-size: 0.82rem; color: #888; margin-bottom: 0.5rem; }
+    .setting-input-row { display: flex; gap: 0.5rem; }
+    .setting-input-row input {
+      flex: 1; background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
+      color: #f0f0f0; font-size: 0.9rem; padding: 0.5rem 0.75rem; font-family: inherit; outline: none;
+    }
+    .save-btn {
+      background: #2563eb; color: #fff; border: none; border-radius: 8px;
+      font-weight: 600; font-size: 0.85rem; padding: 0.5rem 1rem; cursor: pointer;
+    }
+    .setting-msg { font-size: 0.8rem; color: #4ade80; margin-top: 0.35rem; min-height: 1em; }
   </style>
 </head>
 <body>
+  <div id="settings-panel" style="display:none;">
+    <!-- slide-in panel from right -->
+    <div id="settings-overlay"></div>
+    <div id="settings-drawer">
+      <div class="drawer-header">
+        <span>Settings</span>
+        <button class="icon-btn" id="settings-close">&#x2715;</button>
+      </div>
+      <div class="drawer-body">
+        <div class="setting-row">
+          <label>Rider + bike weight</label>
+          <div class="setting-input-row">
+            <input id="weight-input" type="number" placeholder="kg" min="30" max="200" step="0.5" />
+            <button id="weight-save-btn" class="save-btn">Save</button>
+          </div>
+          <div id="weight-msg" class="setting-msg"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <header>
-    <div class="online-dot"></div>
-    <div class="logo">Coach Claude</div>
-    <div class="online-label">online</div>
+    <div class="header-left">
+      <div class="online-dot"></div>
+      <div class="logo">Coach Claude</div>
+      <div class="online-label">online</div>
+    </div>
+    <div class="header-right" id="header-actions" style="display:none;">
+      <button class="icon-btn" id="integrations-btn" title="Integrations">&#x2B21;</button>
+      <button class="icon-btn" id="settings-btn" title="Settings">&#x2699;</button>
+      <button class="icon-btn" id="logout-btn" title="Sign out">&#x21AA;</button>
+    </div>
   </header>
 
-  <!-- Unauthenticated: Connect Strava state -->
+  <!-- Unauthenticated: choose sign-up or sign-in -->
   <div id="connect-screen" class="signup-screen" style="display:none;">
-    <h2>Connect Strava to start</h2>
-    <p>Coach Claude analyses your training data and gives you personalised coaching. Connect your Strava account to begin.</p>
-    <a href="/onboarding" class="strava-btn">Get started</a>
+    <h2>Get started</h2>
+    <p>Coach Claude analyses your training data and gives you personalised coaching.</p>
+    <p style="font-size:0.85rem;color:#666;margin-top:-0.5rem;">Already have an account? Sign in.</p>
+    <div class="connect-options">
+      <a href="/onboarding" class="primary-btn" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">Get started</a>
+      <a href="/login" class="outline-btn">Sign in</a>
+    </div>
   </div>
 
   <!-- Fallback: phone + name form (for direct /chat access without session) -->
@@ -926,6 +1036,50 @@ CHAT_HTML = """<!DOCTYPE html>
     const messages      = document.getElementById('messages');
     const input         = document.getElementById('msg-input');
     const sendBtn       = document.getElementById('send-btn');
+
+    // Header actions — only shown when authenticated
+    const headerActions = document.getElementById('header-actions');
+    const settingsPanel = document.getElementById('settings-panel');
+
+    document.getElementById('integrations-btn').addEventListener('click', () => {
+      window.location.href = '/onboarding';
+    });
+
+    document.getElementById('settings-btn').addEventListener('click', () => {
+      settingsPanel.style.display = 'block';
+    });
+
+    document.getElementById('settings-close').addEventListener('click', () => {
+      settingsPanel.style.display = 'none';
+    });
+
+    document.getElementById('settings-overlay').addEventListener('click', () => {
+      settingsPanel.style.display = 'none';
+    });
+
+    document.getElementById('logout-btn').addEventListener('click', async () => {
+      await fetch('/chat/logout', { method: 'POST' });
+      window.location.href = '/';
+    });
+
+    document.getElementById('weight-save-btn').addEventListener('click', async () => {
+      const weight = parseFloat(document.getElementById('weight-input').value);
+      const msg = document.getElementById('weight-msg');
+      const resp = await fetch('/chat/weight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ weight }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        msg.textContent = 'Saved!';
+        msg.style.color = '#4ade80';
+      } else {
+        msg.textContent = data.error || 'Failed to save.';
+        msg.style.color = '#f87171';
+      }
+      setTimeout(() => { msg.textContent = ''; }, 3000);
+    });
 
     // ---- phone + name step ----
     function normalizePhone(raw) {
@@ -1016,7 +1170,7 @@ CHAT_HTML = """<!DOCTYPE html>
       input.style.height = Math.min(input.scrollHeight, 120) + 'px';
     });
 
-    // ---- check existing session, then fetch personalised greeting ----
+    // ---- check existing session ----
     fetch('/chat/status')
       .then(r => r.json())
       .then(data => {
@@ -1028,26 +1182,11 @@ CHAT_HTML = """<!DOCTYPE html>
           return;
         }
         phoneScreen.classList.remove('active');
+        headerActions.style.display = 'flex';
         chatScreen.style.display = 'flex';
-        sendBtn.disabled = true;
-        input.disabled = true;
-        const loadingTyping = addTyping();
-        fetch('/chat/init')
-          .then(r => r.json())
-          .then(initData => {
-            loadingTyping.remove();
-            addMsg(initData.greeting || 'Hey! I\\'m Coach Claude. How can I help?', 'coach');
-            sendBtn.disabled = false;
-            input.disabled = false;
-            input.focus();
-          })
-          .catch(() => {
-            loadingTyping.remove();
-            addMsg('Hey! I\\'m Coach Claude. How can I help?', 'coach');
-            sendBtn.disabled = false;
-            input.disabled = false;
-            input.focus();
-          });
+        sendBtn.disabled = false;
+        input.disabled = false;
+        input.focus();
       });
   </script>
 </body>
@@ -1072,6 +1211,261 @@ def chat_auth():
         state_payload["name"] = name
     state = base64.urlsafe_b64encode(json.dumps(state_payload).encode()).decode()
     return redirect(strava_client.get_auth_url(f"{public_url}/callback", state=state))
+
+
+# ---------------------------------------------------------------------------
+# OTP — send and verify one-time codes via SMS
+# ---------------------------------------------------------------------------
+
+@app.route("/otp/send", methods=["POST"])
+def otp_send():
+    data = request.get_json(force=True) or {}
+    phone_raw = (data.get("phone") or "").strip()
+    purpose = (data.get("purpose") or "").strip()
+
+    if not phone_raw:
+        return jsonify({"ok": False, "error": "Phone number is required."}), 400
+
+    phone = _normalize_phone(phone_raw)
+
+    if phone not in ALLOWED_PHONES:
+        return jsonify({"ok": False, "error": "This number is not on the allowed list."}), 403
+
+    code = str(random.randint(100000, 999999))
+    session["otp_code"] = code
+    session["otp_expires"] = int(time.time()) + 600
+    session["otp_phone"] = phone
+    session["otp_purpose"] = purpose
+
+    try:
+        sms_sender._send(phone, f"Your Coach Claude code is {code}. Valid for 10 minutes.")
+    except Exception as exc:
+        log.error("OTP send failed to %s: %s", phone, exc)
+        return jsonify({"ok": False, "error": "Failed to send SMS. Please try again."}), 500
+
+    return jsonify({"ok": True})
+
+
+@app.route("/otp/verify", methods=["POST"])
+def otp_verify():
+    data = request.get_json(force=True) or {}
+    entered = (data.get("code") or "").strip()
+
+    stored_code = session.get("otp_code")
+    stored_expires = session.get("otp_expires")
+    purpose = session.get("otp_purpose", "")
+    phone = session.get("otp_phone", "")
+
+    # Always clear OTP from session after an attempt
+    session.pop("otp_code", None)
+    session.pop("otp_expires", None)
+
+    if not stored_code or not stored_expires:
+        return jsonify({"ok": False, "error": "No code found. Please request a new one."}), 400
+
+    if int(time.time()) > stored_expires:
+        return jsonify({"ok": False, "error": "Code has expired. Please request a new one."}), 400
+
+    if entered != stored_code:
+        return jsonify({"ok": False, "error": "Invalid or expired code."}), 400
+
+    session["otp_verified"] = True
+    return jsonify({"ok": True, "purpose": purpose, "phone": phone})
+
+
+# ---------------------------------------------------------------------------
+# Login — phone OTP login for returning users
+# ---------------------------------------------------------------------------
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude &mdash; Sign in</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a; color: #f0f0f0;
+      min-height: 100dvh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 2rem 1.5rem;
+    }
+    .card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 1.5rem; }
+    .logo { font-weight: 800; font-size: 1.1rem; color: #fff; text-align: center; }
+    h1 { font-size: 1.5rem; font-weight: 700; text-align: center; }
+    p.sub { color: #888; font-size: 0.92rem; text-align: center; line-height: 1.6; }
+    label { font-size: 0.85rem; color: #888; display: block; margin-bottom: 0.35rem; }
+    input[type="tel"], input[type="text"] {
+      background: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 8px;
+      color: #f0f0f0; font-size: 1rem; padding: 0.7rem 1rem; outline: none;
+      width: 100%; font-family: inherit;
+    }
+    input:focus { border-color: #4ade80; }
+    input::placeholder { color: #555; }
+    .error-msg { font-size: 0.82rem; color: #f87171; min-height: 1em; }
+    .primary-btn {
+      background: #4ade80; color: #0a0a0a; border: none; border-radius: 8px;
+      font-weight: 700; font-size: 0.95rem; padding: 0.75rem 2rem;
+      cursor: pointer; transition: opacity 0.15s; width: 100%;
+    }
+    .primary-btn:hover { opacity: 0.85; }
+    .primary-btn:disabled { opacity: 0.4; cursor: default; }
+    .step { display: flex; flex-direction: column; gap: 0.75rem; }
+    .step.hidden { display: none; }
+    .signup-link { text-align: center; font-size: 0.85rem; color: #555; }
+    .signup-link a { color: #4ade80; text-decoration: none; }
+    .signup-link a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Coach Claude</div>
+    <h1>Sign in</h1>
+    <p class="sub">Enter your phone number to receive a verification code.</p>
+
+    <!-- Step 1: phone entry -->
+    <div id="step-phone" class="step">
+      <div>
+        <label for="phone-input">Phone number</label>
+        <input id="phone-input" type="tel" placeholder="+1 555 000 0000" autocomplete="tel" />
+        <div id="phone-error" class="error-msg"></div>
+      </div>
+      <button id="send-code-btn" class="primary-btn">Send code</button>
+    </div>
+
+    <!-- Step 2: code entry -->
+    <div id="step-code" class="step hidden">
+      <div>
+        <label for="code-input">6-digit code</label>
+        <input id="code-input" type="text" placeholder="123456" maxlength="6" inputmode="numeric" />
+        <div id="code-error" class="error-msg"></div>
+      </div>
+      <button id="verify-btn" class="primary-btn">Sign in</button>
+    </div>
+
+    <div class="signup-link">
+      Don't have an account? <a href="/onboarding">Get started</a>
+    </div>
+  </div>
+
+  <script>
+    function normalizePhone(raw) {
+      const digits = raw.replace(/\\D/g, '');
+      if (digits.length === 10) return '+1' + digits;
+      if (digits.length === 11 && digits[0] === '1') return '+' + digits;
+      if (digits.length > 7) return '+' + digits;
+      return null;
+    }
+
+    const stepPhone  = document.getElementById('step-phone');
+    const stepCode   = document.getElementById('step-code');
+    const phoneInput = document.getElementById('phone-input');
+    const phoneError = document.getElementById('phone-error');
+    const codeInput  = document.getElementById('code-input');
+    const codeError  = document.getElementById('code-error');
+    const sendBtn    = document.getElementById('send-code-btn');
+    const verifyBtn  = document.getElementById('verify-btn');
+
+    sendBtn.addEventListener('click', async () => {
+      const phone = normalizePhone(phoneInput.value.trim());
+      if (!phone) { phoneError.textContent = 'Please enter a valid phone number.'; return; }
+      phoneError.textContent = '';
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Sending...';
+      try {
+        const res = await fetch('/otp/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, purpose: 'login' }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          stepPhone.classList.add('hidden');
+          stepCode.classList.remove('hidden');
+          codeInput.focus();
+        } else {
+          phoneError.textContent = data.error || 'Failed to send code.';
+          sendBtn.disabled = false;
+          sendBtn.textContent = 'Send code';
+        }
+      } catch (e) {
+        phoneError.textContent = 'Network error. Please try again.';
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send code';
+      }
+    });
+
+    phoneInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+
+    verifyBtn.addEventListener('click', async () => {
+      const code = codeInput.value.trim();
+      if (!code) { codeError.textContent = 'Please enter the code.'; return; }
+      codeError.textContent = '';
+      verifyBtn.disabled = true;
+      verifyBtn.textContent = 'Verifying...';
+      try {
+        const res = await fetch('/otp/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          const authRes = await fetch('/login/auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+          });
+          const authData = await authRes.json();
+          if (authData.ok) {
+            window.location.href = '/chat';
+          } else {
+            codeError.textContent = authData.error || 'Sign-in failed.';
+            verifyBtn.disabled = false;
+            verifyBtn.textContent = 'Sign in';
+          }
+        } else {
+          codeError.textContent = data.error || 'Invalid code.';
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Sign in';
+        }
+      } catch (e) {
+        codeError.textContent = 'Network error. Please try again.';
+        verifyBtn.disabled = false;
+        verifyBtn.textContent = 'Sign in';
+      }
+    });
+
+    codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verifyBtn.click(); });
+  </script>
+</body>
+</html>"""
+
+
+@app.route("/login")
+def login():
+    return _LOGIN_HTML, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/login/auth", methods=["POST"])
+def login_auth():
+    if not session.get("otp_verified"):
+        return jsonify({"ok": False, "error": "OTP verification required."}), 403
+
+    phone = session.get("otp_phone", "")
+    session.pop("otp_verified", None)
+
+    if not phone:
+        return jsonify({"ok": False, "error": "Session missing phone. Please start over."}), 400
+
+    user = db.get_user_by_phone(phone)
+    if not user:
+        return jsonify({"ok": False, "error": "No account found. Please sign up."}), 404
+
+    session["athlete_id"] = user["athlete_id"]
+    session["athlete_name"] = user.get("name", "")
+    log.info("Login via OTP for athlete %d (%s)", user["athlete_id"], phone)
+    return jsonify({"ok": True})
 
 
 def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connected: bool) -> str:
@@ -1103,9 +1497,9 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
 
     # Bottom action
     if strava_connected:
-        bottom_action = '<a href="/chat" class="start-btn">Start chatting &#8594;</a>'
+        bottom_action = '<a href="/chat" class="start-btn">Start chatting &#8594;</a>\n    <a href="/login" class="skip-link">Already have an account? Sign in &rarr;</a>'
     else:
-        bottom_action = ""
+        bottom_action = '<a href="/login" class="skip-link">Already have an account? Sign in &rarr;</a>'
 
     strava_tile_class = "tile tile-primary tile-done" if strava_connected else "tile tile-primary"
 
@@ -1128,10 +1522,17 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
           <div class="tile-name">Strava <span class="tile-badge">Needed for rides</span></div>
           <div class="tile-desc">Analyse your outdoor rides and calculate aerodynamic CdA after every upload.</div>
           <div class="inline-form" id="strava-form">
-            <input id="ob-name" type="text" placeholder="Your name" autocomplete="name" />
-            <input id="ob-phone" type="tel" placeholder="Phone (e.g. +16035317244)" autocomplete="tel" />
-            <div id="ob-error" class="form-error"></div>
-            <a id="strava-connect-btn" class="connect-btn strava-connect" onclick="return connectStrava()">Connect Strava</a>
+            <div id="ob-step1">
+              <input id="ob-name" type="text" placeholder="Your name" autocomplete="name" style="margin-bottom:0.5rem;" />
+              <input id="ob-phone" type="tel" placeholder="Phone (e.g. +16035317244)" autocomplete="tel" />
+              <div id="ob-error" class="form-error"></div>
+              <a id="ob-send-btn" class="connect-btn strava-connect" onclick="return obSendCode()">Send code</a>
+            </div>
+            <div id="ob-step2" style="display:none;">
+              <input id="ob-code" type="text" placeholder="6-digit code" maxlength="6" inputmode="numeric" />
+              <div id="ob-code-error" class="form-error"></div>
+              <a id="ob-verify-btn" class="connect-btn strava-connect" onclick="return obVerifyCode()">Verify &amp; connect Strava</a>
+            </div>
           </div>
         </div>
       </div>"""
@@ -1337,8 +1738,8 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
 
   <main>
     <div class="heading">
-      <h2>Connect what you use</h2>
-      <p>All sources are optional, but Strava is needed for ride analysis and CdA calculations.</p>
+      <h2>Create your account</h2>
+      <p>Connect your training data to get started. Strava is needed for ride analysis and CdA calculations.</p>
     </div>
 
     <div class="tiles">
@@ -1389,16 +1790,71 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
       return '+' + digits;
     }}
 
-    function connectStrava() {{
+    async function obSendCode() {{
       const name = (document.getElementById('ob-name')?.value || '').trim();
       const rawPhone = (document.getElementById('ob-phone')?.value || '').trim();
       const err = document.getElementById('ob-error');
       if (!rawPhone) {{ if (err) err.textContent = 'Phone number is required.'; return false; }}
       const phone = normalizePhone(rawPhone);
       if (err) err.textContent = '';
-      const params = new URLSearchParams({{ phone }});
-      if (name) params.set('name', name);
-      window.location.href = '/chat/auth?' + params.toString();
+      const btn = document.getElementById('ob-send-btn');
+      btn.textContent = 'Sending...';
+      btn.style.pointerEvents = 'none';
+      try {{
+        const res = await fetch('/otp/send', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ phone, purpose: 'onboarding' }}),
+        }});
+        const data = await res.json();
+        if (data.ok) {{
+          document.getElementById('ob-step1').style.display = 'none';
+          document.getElementById('ob-step2').style.display = 'block';
+          document.getElementById('ob-code').focus();
+        }} else {{
+          if (err) err.textContent = data.error || 'Failed to send code.';
+          btn.textContent = 'Send code';
+          btn.style.pointerEvents = '';
+        }}
+      }} catch (e) {{
+        if (err) err.textContent = 'Network error. Please try again.';
+        btn.textContent = 'Send code';
+        btn.style.pointerEvents = '';
+      }}
+      return false;
+    }}
+
+    async function obVerifyCode() {{
+      const code = (document.getElementById('ob-code')?.value || '').trim();
+      const codeErr = document.getElementById('ob-code-error');
+      if (!code) {{ if (codeErr) codeErr.textContent = 'Please enter the code.'; return false; }}
+      if (codeErr) codeErr.textContent = '';
+      const btn = document.getElementById('ob-verify-btn');
+      btn.textContent = 'Verifying...';
+      btn.style.pointerEvents = 'none';
+      try {{
+        const res = await fetch('/otp/verify', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{ code }}),
+        }});
+        const data = await res.json();
+        if (data.ok) {{
+          const name = (document.getElementById('ob-name')?.value || '').trim();
+          const phone = data.phone;
+          const params = new URLSearchParams({{ phone }});
+          if (name) params.set('name', name);
+          window.location.href = '/chat/auth?' + params.toString();
+        }} else {{
+          if (codeErr) codeErr.textContent = data.error || 'Invalid code.';
+          btn.textContent = 'Verify & connect Strava';
+          btn.style.pointerEvents = '';
+        }}
+      }} catch (e) {{
+        if (codeErr) codeErr.textContent = 'Network error. Please try again.';
+        btn.textContent = 'Verify & connect Strava';
+        btn.style.pointerEvents = '';
+      }}
       return false;
     }}
   </script>
@@ -2178,6 +2634,28 @@ def chat_profile_refresh():
         return jsonify({"error": "User not found"}), 401
     threading.Thread(target=_safe_build_profile, args=(user,), daemon=True).start()
     return jsonify({"status": "refreshing"})
+
+
+@app.route("/chat/logout", methods=["POST"])
+def chat_logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.route("/chat/weight", methods=["POST"])
+def chat_weight():
+    athlete_id = session.get("athlete_id")
+    if not athlete_id:
+        return jsonify({"ok": False}), 401
+    data = request.get_json(force=True) or {}
+    try:
+        weight = float(data.get("weight", 0))
+        if weight < 30 or weight > 300:
+            return jsonify({"ok": False, "error": "Weight must be between 30 and 300 kg."})
+        db.set_weight(athlete_id, weight)
+        return jsonify({"ok": True})
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "Invalid weight."})
 
 
 # ---------------------------------------------------------------------------
