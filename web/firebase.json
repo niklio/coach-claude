@@ -3,6 +3,27 @@
     "public": "public",
     "ignore": ["firebase.json", "**/.*"],
     "rewrites": [
+      {
+        "source": "/chat**",
+        "run": {
+          "serviceId": "coach-claude",
+          "region": "us-east1"
+        }
+      },
+      {
+        "source": "/auth**",
+        "run": {
+          "serviceId": "coach-claude",
+          "region": "us-east1"
+        }
+      },
+      {
+        "source": "/callback**",
+        "run": {
+          "serviceId": "coach-claude",
+          "region": "us-east1"
+        }
+      },
       { "source": "**", "destination": "/index.html" }
     ],
     "headers": [
