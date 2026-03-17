@@ -30,7 +30,7 @@ jobs:
             --region us-east1 \
             --allow-unauthenticated \
             --port 8080 \
-            --set-env-vars PUBLIC_URL=https://irlll.com \
+            --update-env-vars PUBLIC_URL=https://irlll.com \
             --project coach-8413d
 
   deploy-web:
