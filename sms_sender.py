@@ -41,11 +41,8 @@ def _send(to: str, body: str) -> None:
     public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
     if public_url:
         kwargs["status_callback"] = f"{public_url}/sms/status"
-    try:
-        msg = _client().messages.create(**kwargs)
-        log.info("SMS sent to %s: SID %s", to, msg.sid)
-    except TwilioRestException as e:
-        log.error("Failed to send SMS to %s: %s", to, e)
+    msg = _client().messages.create(**kwargs)
+    log.info("SMS sent to %s: SID %s", to, msg.sid)
 
 
 def send_weight_request(to: str) -> None:
