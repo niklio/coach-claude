@@ -1201,8 +1201,9 @@ def chat_ui():
 
 @app.route("/chat/auth")
 def chat_auth():
-    phone = request.args.get("phone", "").strip()
-    name = request.args.get("name", "").strip()
+    # Prefer phone/name stored in session by the signup OTP flow; fall back to URL params
+    phone = session.get("pending_phone") or request.args.get("phone", "").strip()
+    name = session.get("pending_name") or request.args.get("name", "").strip()
     if _normalize_phone(phone) not in ALLOWED_PHONES:
         return _PRIVATE_BETA_HTML, 403, {"Content-Type": "text/html"}
     public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
@@ -1236,6 +1237,10 @@ def otp_send():
     session["otp_expires"] = int(time.time()) + 600
     session["otp_phone"] = phone
     session["otp_purpose"] = purpose
+    # Store name during onboarding so /onboarding can read it from session
+    name = (data.get("name") or "").strip()
+    if name:
+        session["otp_name"] = name
 
     try:
         sms_sender._send(phone, f"Your Coach Claude code is {code}. Valid for 10 minutes.")
@@ -1270,7 +1275,181 @@ def otp_verify():
         return jsonify({"ok": False, "error": "Invalid or expired code."}), 400
 
     session["otp_verified"] = True
+    # For onboarding: persist phone + name so /chat/auth can read from session
+    if purpose == "onboarding":
+        session["pending_phone"] = phone
+        session["pending_name"] = session.pop("otp_name", "")
     return jsonify({"ok": True, "purpose": purpose, "phone": phone})
+
+
+# ---------------------------------------------------------------------------
+# Signup — new user name + phone collection + OTP, then → /onboarding
+# ---------------------------------------------------------------------------
+
+_SIGNUP_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coach Claude &mdash; Create account</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: #0a0a0a; color: #f0f0f0;
+      min-height: 100dvh; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 2rem 1.5rem;
+    }
+    .card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 1.5rem; }
+    .logo { font-weight: 800; font-size: 1.1rem; color: #fff; text-align: center; }
+    h1 { font-size: 1.5rem; font-weight: 700; text-align: center; }
+    p.sub { color: #888; font-size: 0.92rem; text-align: center; line-height: 1.6; }
+    label { font-size: 0.85rem; color: #888; display: block; margin-bottom: 0.35rem; }
+    input[type="text"], input[type="tel"] {
+      background: #1e1e1e; border: 1px solid #2a2a2a; border-radius: 8px;
+      color: #f0f0f0; font-size: 1rem; padding: 0.7rem 1rem; outline: none;
+      width: 100%; font-family: inherit;
+    }
+    input:focus { border-color: #4ade80; }
+    input::placeholder { color: #555; }
+    .error-msg { font-size: 0.82rem; color: #f87171; min-height: 1em; }
+    .primary-btn {
+      background: #4ade80; color: #0a0a0a; border: none; border-radius: 8px;
+      font-weight: 700; font-size: 0.95rem; padding: 0.75rem 2rem;
+      cursor: pointer; transition: opacity 0.15s; width: 100%;
+    }
+    .primary-btn:hover { opacity: 0.85; }
+    .primary-btn:disabled { opacity: 0.4; cursor: default; }
+    .step { display: flex; flex-direction: column; gap: 0.75rem; }
+    .step.hidden { display: none; }
+    .signin-link { text-align: center; font-size: 0.85rem; color: #555; }
+    .signin-link a { color: #4ade80; text-decoration: none; }
+    .signin-link a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">Coach Claude</div>
+    <h1>Create your account</h1>
+    <p class="sub">Enter your details to get started.</p>
+
+    <!-- Step 1: name + phone -->
+    <div id="step-info" class="step">
+      <div>
+        <label for="name-input">Your name</label>
+        <input id="name-input" type="text" placeholder="Jane Smith" autocomplete="name" />
+      </div>
+      <div>
+        <label for="phone-input">Phone number</label>
+        <input id="phone-input" type="tel" placeholder="+1 555 000 0000" autocomplete="tel" />
+        <div id="info-error" class="error-msg"></div>
+      </div>
+      <button id="send-code-btn" class="primary-btn">Send verification code</button>
+    </div>
+
+    <!-- Step 2: OTP -->
+    <div id="step-code" class="step hidden">
+      <div>
+        <label for="code-input">6-digit code</label>
+        <input id="code-input" type="text" placeholder="123456" maxlength="6" inputmode="numeric" />
+        <div id="code-error" class="error-msg"></div>
+      </div>
+      <button id="verify-btn" class="primary-btn">Continue</button>
+    </div>
+
+    <div class="signin-link">Already have an account? <a href="/login">Sign in</a></div>
+  </div>
+
+  <script>
+    function normalizePhone(raw) {
+      const digits = raw.replace(/\\D/g, '');
+      if (digits.length === 10) return '+1' + digits;
+      if (digits.length === 11 && digits[0] === '1') return '+' + digits;
+      if (digits.length > 7) return '+' + digits;
+      return null;
+    }
+
+    const stepInfo  = document.getElementById('step-info');
+    const stepCode  = document.getElementById('step-code');
+    const nameInput = document.getElementById('name-input');
+    const phoneInput = document.getElementById('phone-input');
+    const infoError = document.getElementById('info-error');
+    const codeInput = document.getElementById('code-input');
+    const codeError = document.getElementById('code-error');
+    const sendBtn   = document.getElementById('send-code-btn');
+    const verifyBtn = document.getElementById('verify-btn');
+
+    sendBtn.addEventListener('click', async () => {
+      const name = nameInput.value.trim();
+      const phone = normalizePhone(phoneInput.value.trim());
+      if (!phone) { infoError.textContent = 'Please enter a valid phone number.'; return; }
+      infoError.textContent = '';
+      sendBtn.disabled = true;
+      sendBtn.textContent = 'Sending...';
+      try {
+        const res = await fetch('/otp/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, name, purpose: 'onboarding' }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          stepInfo.classList.add('hidden');
+          stepCode.classList.remove('hidden');
+          codeInput.focus();
+        } else {
+          infoError.textContent = data.error || 'Failed to send code.';
+          sendBtn.disabled = false;
+          sendBtn.textContent = 'Send verification code';
+        }
+      } catch (e) {
+        infoError.textContent = 'Network error. Please try again.';
+        sendBtn.disabled = false;
+        sendBtn.textContent = 'Send verification code';
+      }
+    });
+
+    phoneInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendBtn.click(); });
+
+    verifyBtn.addEventListener('click', async () => {
+      const code = codeInput.value.trim();
+      if (!code) { codeError.textContent = 'Please enter the code.'; return; }
+      codeError.textContent = '';
+      verifyBtn.disabled = true;
+      verifyBtn.textContent = 'Verifying...';
+      try {
+        const res = await fetch('/otp/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          window.location.href = '/onboarding';
+        } else {
+          codeError.textContent = data.error || 'Invalid code.';
+          verifyBtn.disabled = false;
+          verifyBtn.textContent = 'Continue';
+        }
+      } catch (e) {
+        codeError.textContent = 'Network error. Please try again.';
+        verifyBtn.disabled = false;
+        verifyBtn.textContent = 'Continue';
+      }
+    });
+
+    codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') verifyBtn.click(); });
+  </script>
+</body>
+</html>"""
+
+
+@app.route("/signup")
+def signup():
+    # Already has an active session — go straight to chat
+    if session.get("athlete_id"):
+        return redirect(os.getenv("PUBLIC_URL", request.host_url.rstrip("/")) + "/chat")
+    return _SIGNUP_HTML, 200, {"Content-Type": "text/html"}
 
 
 # ---------------------------------------------------------------------------
@@ -1471,13 +1650,11 @@ def login_auth():
 def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connected: bool) -> str:
     """Render the unified onboarding / connect-your-data page."""
 
-    # Strava tile button — when not connected, show an inline form for phone+name
+    # Strava tile button
     if strava_connected:
         strava_btn = '<span class="connect-btn connected">Connected &#10003;</span>'
-        strava_extra = ""
     else:
-        strava_btn = ""  # rendered inside the form below
-        strava_extra = ""
+        strava_btn = '<a href="/chat/auth" class="connect-btn strava-connect">Connect Strava</a>'
 
     # Garmin tile button
     if garmin_connected:
@@ -1503,9 +1680,7 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
 
     strava_tile_class = "tile tile-primary tile-done" if strava_connected else "tile tile-primary"
 
-    # When Strava isn't connected yet, render the tile with an inline phone+name form
-    if strava_connected:
-        strava_tile_content = f"""
+    strava_tile_content = f"""
       <div class="{strava_tile_class}">
         <div class="tile-icon strava">S</div>
         <div class="tile-info">
@@ -1513,28 +1688,6 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
           <div class="tile-desc">Analyse your outdoor rides and calculate aerodynamic CdA after every upload.</div>
         </div>
         {strava_btn}
-      </div>"""
-    else:
-        strava_tile_content = f"""
-      <div class="{strava_tile_class}">
-        <div class="tile-icon strava">S</div>
-        <div class="tile-info">
-          <div class="tile-name">Strava <span class="tile-badge">Needed for rides</span></div>
-          <div class="tile-desc">Analyse your outdoor rides and calculate aerodynamic CdA after every upload.</div>
-          <div class="inline-form" id="strava-form">
-            <div id="ob-step1">
-              <input id="ob-name" type="text" placeholder="Your name" autocomplete="name" style="margin-bottom:0.5rem;" />
-              <input id="ob-phone" type="tel" placeholder="Phone (e.g. +16035317244)" autocomplete="tel" />
-              <div id="ob-error" class="form-error"></div>
-              <a id="ob-send-btn" class="connect-btn strava-connect" onclick="return obSendCode()">Send code</a>
-            </div>
-            <div id="ob-step2" style="display:none;">
-              <input id="ob-code" type="text" placeholder="6-digit code" maxlength="6" inputmode="numeric" />
-              <div id="ob-code-error" class="form-error"></div>
-              <a id="ob-verify-btn" class="connect-btn strava-connect" onclick="return obVerifyCode()">Verify &amp; connect Strava</a>
-            </div>
-          </div>
-        </div>
       </div>"""
 
     return f"""<!DOCTYPE html>
@@ -1703,31 +1856,6 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
       transition: color 0.15s;
     }}
     .skip-link:hover {{ color: #888; }}
-
-    .inline-form {{
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-      margin-top: 0.75rem;
-    }}
-    .inline-form input {{
-      background: #0a0a0a;
-      border: 1px solid #333;
-      border-radius: 8px;
-      color: #f0f0f0;
-      font-size: 0.88rem;
-      padding: 0.55rem 0.85rem;
-      font-family: inherit;
-      outline: none;
-      width: 100%;
-    }}
-    .inline-form input:focus {{ border-color: #555; }}
-    .inline-form input::placeholder {{ color: #444; }}
-    .form-error {{
-      font-size: 0.8rem;
-      color: #f87171;
-      min-height: 1em;
-    }}
   </style>
 </head>
 <body>
@@ -1782,82 +1910,7 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
     {bottom_action}
   </main>
 
-  <script>
-    function normalizePhone(raw) {{
-      const digits = raw.replace(/\\D/g, '');
-      if (digits.length === 10) return '+1' + digits;
-      if (digits.length === 11 && digits[0] === '1') return '+' + digits;
-      return '+' + digits;
-    }}
-
-    async function obSendCode() {{
-      const name = (document.getElementById('ob-name')?.value || '').trim();
-      const rawPhone = (document.getElementById('ob-phone')?.value || '').trim();
-      const err = document.getElementById('ob-error');
-      if (!rawPhone) {{ if (err) err.textContent = 'Phone number is required.'; return false; }}
-      const phone = normalizePhone(rawPhone);
-      if (err) err.textContent = '';
-      const btn = document.getElementById('ob-send-btn');
-      btn.textContent = 'Sending...';
-      btn.style.pointerEvents = 'none';
-      try {{
-        const res = await fetch('/otp/send', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ phone, purpose: 'onboarding' }}),
-        }});
-        const data = await res.json();
-        if (data.ok) {{
-          document.getElementById('ob-step1').style.display = 'none';
-          document.getElementById('ob-step2').style.display = 'block';
-          document.getElementById('ob-code').focus();
-        }} else {{
-          if (err) err.textContent = data.error || 'Failed to send code.';
-          btn.textContent = 'Send code';
-          btn.style.pointerEvents = '';
-        }}
-      }} catch (e) {{
-        if (err) err.textContent = 'Network error. Please try again.';
-        btn.textContent = 'Send code';
-        btn.style.pointerEvents = '';
-      }}
-      return false;
-    }}
-
-    async function obVerifyCode() {{
-      const code = (document.getElementById('ob-code')?.value || '').trim();
-      const codeErr = document.getElementById('ob-code-error');
-      if (!code) {{ if (codeErr) codeErr.textContent = 'Please enter the code.'; return false; }}
-      if (codeErr) codeErr.textContent = '';
-      const btn = document.getElementById('ob-verify-btn');
-      btn.textContent = 'Verifying...';
-      btn.style.pointerEvents = 'none';
-      try {{
-        const res = await fetch('/otp/verify', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{ code }}),
-        }});
-        const data = await res.json();
-        if (data.ok) {{
-          const name = (document.getElementById('ob-name')?.value || '').trim();
-          const phone = data.phone;
-          const params = new URLSearchParams({{ phone }});
-          if (name) params.set('name', name);
-          window.location.href = '/chat/auth?' + params.toString();
-        }} else {{
-          if (codeErr) codeErr.textContent = data.error || 'Invalid code.';
-          btn.textContent = 'Verify & connect Strava';
-          btn.style.pointerEvents = '';
-        }}
-      }} catch (e) {{
-        if (codeErr) codeErr.textContent = 'Network error. Please try again.';
-        btn.textContent = 'Verify & connect Strava';
-        btn.style.pointerEvents = '';
-      }}
-      return false;
-    }}
-  </script>
+  <script></script>
 </body>
 </html>"""
 
@@ -1865,6 +1918,10 @@ def _render_onboarding(strava_connected: bool, garmin_connected: bool, tp_connec
 @app.route("/onboarding")
 def onboarding():
     athlete_id = session.get("athlete_id")
+    # Guard: must have completed phone verification (or already have a full session)
+    if not athlete_id and not session.get("pending_phone"):
+        public_url = os.getenv("PUBLIC_URL", request.host_url.rstrip("/"))
+        return redirect(f"{public_url}/signup")
     strava_connected = bool(athlete_id)
     garmin_connected = False
     tp_connected = False
