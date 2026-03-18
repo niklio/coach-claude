@@ -2738,15 +2738,202 @@ def chat_weight():
 # Privacy policy — required URL for Twilio A2P 10DLC campaign registration
 # ---------------------------------------------------------------------------
 
+_LEGAL_CSS = """
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #0a0a0a; color: #d0d0d0; line-height: 1.7;
+    padding: 3rem 1.5rem 5rem;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  .logo { font-weight: 800; font-size: 1rem; color: #fff; margin-bottom: 2.5rem; display: block; text-decoration: none; }
+  h1 { font-size: 2rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem; }
+  .updated { font-size: 0.82rem; color: #555; margin-bottom: 2.5rem; }
+  h2 { font-size: 1.1rem; font-weight: 700; color: #fff; margin: 2rem 0 0.5rem; }
+  p { margin-bottom: 1rem; font-size: 0.95rem; }
+  ul { margin: 0.5rem 0 1rem 1.5rem; font-size: 0.95rem; }
+  li { margin-bottom: 0.35rem; }
+  a { color: #4ade80; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .footer { margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid #1e1e1e; font-size: 0.82rem; color: #555; }
+"""
+
+
 @app.route("/privacy")
+@app.route("/privacy-policy")
 def privacy():
-    return (
-        "<h1>Privacy Policy</h1>"
-        "<p>Coach Claude collects your phone number and Strava activity data solely to deliver "
-        "cycling performance analysis via SMS. Your data is not sold or shared with third parties. "
-        "To stop receiving messages, reply STOP to any SMS. "
-        "Contact: nikliolios@irlll.com</p>"
-    ), 200, {"Content-Type": "text/html"}
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy — Coach Claude</title>
+  <style>{_LEGAL_CSS}</style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="logo" href="/">Coach Claude</a>
+    <h1>Privacy Policy</h1>
+    <p class="updated">Last updated: March 18, 2026</p>
+
+    <p>Coach Claude ("we", "us", or "our") is a personal cycling performance coaching service
+    operated by Nikolas Liolios. This policy explains what data we collect, why, and how we
+    protect it.</p>
+
+    <h2>1. Data We Collect</h2>
+    <ul>
+      <li><strong>Phone number</strong> — used to send you SMS coaching updates and to identify your account.</li>
+      <li><strong>Name</strong> — used to personalise coaching messages.</li>
+      <li><strong>Strava activity data</strong> — ride GPS, power, speed, and elevation streams used to calculate your aerodynamic drag coefficient (CdA) and build your training profile.</li>
+      <li><strong>Body weight</strong> — provided by you; used in CdA calculations.</li>
+      <li><strong>Chat messages</strong> — your conversations with Coach Claude are stored to provide context across sessions.</li>
+      <li><strong>Garmin &amp; TrainingPeaks data</strong> (if connected) — workout history used to enrich your training profile.</li>
+    </ul>
+
+    <h2>2. How We Use Your Data</h2>
+    <ul>
+      <li>Deliver CdA analysis via SMS after outdoor rides.</li>
+      <li>Power the AI coaching chat interface.</li>
+      <li>Build and maintain your athlete training profile.</li>
+      <li>Improve the accuracy of analysis over time using your historical data.</li>
+    </ul>
+
+    <h2>3. Data Sharing</h2>
+    <p>We do not sell or rent your personal data. We share data only with the third-party services
+    required to operate Coach Claude:</p>
+    <ul>
+      <li><strong>Strava</strong> — to read your activity data via OAuth.</li>
+      <li><strong>Twilio</strong> — to send and receive SMS messages.</li>
+      <li><strong>Anthropic</strong> — your messages are sent to the Claude API to generate coaching responses.</li>
+      <li><strong>Google Cloud (Firestore)</strong> — all user data is stored in Google Cloud Firestore, hosted in the United States.</li>
+      <li><strong>Garmin / TrainingPeaks</strong> — only if you connect these integrations.</li>
+    </ul>
+
+    <h2>4. Data Retention</h2>
+    <p>Your data is retained for as long as your account is active. You may request deletion at
+    any time by contacting us at <a href="mailto:nikliolios@irlll.com">nikliolios@irlll.com</a>.</p>
+
+    <h2>5. SMS Opt-Out</h2>
+    <p>To stop receiving SMS messages, reply <strong>STOP</strong> to any message from Coach Claude.
+    You will receive a final confirmation and no further messages will be sent.
+    Reply <strong>START</strong> at any time to resubscribe.</p>
+
+    <h2>6. Security</h2>
+    <p>Data is stored in Google Cloud Firestore with access controlled via service account
+    credentials. OAuth tokens are stored encrypted at rest by Google Cloud. We do not store
+    passwords.</p>
+
+    <h2>7. Your Rights</h2>
+    <p>You may request access to, correction of, or deletion of your personal data at any time.
+    Contact us at <a href="mailto:nikliolios@irlll.com">nikliolios@irlll.com</a>.</p>
+
+    <h2>8. Changes to This Policy</h2>
+    <p>We may update this policy periodically. Continued use of the service after changes
+    constitutes acceptance of the updated policy.</p>
+
+    <h2>9. Contact</h2>
+    <p>Nikolas Liolios &mdash; <a href="mailto:nikliolios@irlll.com">nikliolios@irlll.com</a></p>
+
+    <div class="footer">
+      <a href="/">Coach Claude</a> &nbsp;&middot;&nbsp;
+      <a href="/terms-and-conditions">Terms &amp; Conditions</a>
+    </div>
+  </div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
+
+
+@app.route("/terms-and-conditions")
+def terms():
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Terms &amp; Conditions — Coach Claude</title>
+  <style>{_LEGAL_CSS}</style>
+</head>
+<body>
+  <div class="wrap">
+    <a class="logo" href="/">Coach Claude</a>
+    <h1>Terms &amp; Conditions</h1>
+    <p class="updated">Last updated: March 18, 2026</p>
+
+    <p>These Terms &amp; Conditions ("Terms") govern your use of the Coach Claude service
+    operated by Nikolas Liolios ("we", "us", or "our"). By using Coach Claude you agree to
+    these Terms.</p>
+
+    <h2>1. Service Description</h2>
+    <p>Coach Claude is an AI-powered cycling performance coaching service that analyses your
+    Strava ride data to estimate your aerodynamic drag coefficient (CdA) and provides
+    personalised training guidance via SMS and a web chat interface.</p>
+
+    <h2>2. Eligibility</h2>
+    <p>The service is currently in private beta and access is limited to invited users. You must
+    have a valid Strava account to use the core features.</p>
+
+    <h2>3. Your Account</h2>
+    <ul>
+      <li>You are responsible for providing accurate information (name, phone number, body weight).</li>
+      <li>You must notify us immediately if you believe your account has been compromised.</li>
+      <li>We reserve the right to suspend or terminate accounts that violate these Terms.</li>
+    </ul>
+
+    <h2>4. Acceptable Use</h2>
+    <p>You agree not to:</p>
+    <ul>
+      <li>Use the service for any unlawful purpose.</li>
+      <li>Attempt to reverse-engineer, scrape, or abuse the service or its APIs.</li>
+      <li>Impersonate another person or provide false information.</li>
+      <li>Send spam or abusive content via the chat or SMS interface.</li>
+    </ul>
+
+    <h2>5. AI-Generated Content</h2>
+    <p>Coaching responses are generated by an AI (Anthropic Claude) and are provided for
+    informational purposes only. They do not constitute professional athletic, medical, or
+    nutritional advice. Always consult a qualified professional before making significant changes
+    to your training or diet.</p>
+
+    <h2>6. Third-Party Services</h2>
+    <p>Coach Claude connects to Strava, Twilio, Anthropic, Garmin, and TrainingPeaks. Your use
+    of those services is subject to their respective terms and privacy policies. We are not
+    responsible for the availability or accuracy of data provided by third-party services.</p>
+
+    <h2>7. Disclaimer of Warranties</h2>
+    <p>The service is provided "as is" and "as available" without warranties of any kind, express
+    or implied. We do not guarantee that CdA estimates or coaching recommendations are accurate
+    or suitable for your individual circumstances.</p>
+
+    <h2>8. Limitation of Liability</h2>
+    <p>To the fullest extent permitted by law, we shall not be liable for any indirect,
+    incidental, special, or consequential damages arising from your use of or inability to use
+    the service, even if advised of the possibility of such damages.</p>
+
+    <h2>9. SMS Messaging</h2>
+    <p>By providing your phone number and completing sign-up, you consent to receive SMS messages
+    from Coach Claude. Message and data rates may apply. Reply <strong>STOP</strong> to
+    unsubscribe at any time. Reply <strong>HELP</strong> for help.</p>
+
+    <h2>10. Changes to These Terms</h2>
+    <p>We may update these Terms at any time. Continued use of the service after changes are
+    posted constitutes your acceptance of the revised Terms.</p>
+
+    <h2>11. Governing Law</h2>
+    <p>These Terms are governed by the laws of the State of New Hampshire, United States,
+    without regard to conflict of law principles.</p>
+
+    <h2>12. Contact</h2>
+    <p>Nikolas Liolios &mdash; <a href="mailto:nikliolios@irlll.com">nikliolios@irlll.com</a></p>
+
+    <div class="footer">
+      <a href="/">Coach Claude</a> &nbsp;&middot;&nbsp;
+      <a href="/privacy-policy">Privacy Policy</a>
+    </div>
+  </div>
+</body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html"}
 
 
 # ---------------------------------------------------------------------------

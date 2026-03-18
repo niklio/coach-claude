@@ -24,6 +24,18 @@
           "region": "us-east1"
         }
       },
+      {
+        "source": "/privacy-policy",
+        "run": { "serviceId": "coach-claude", "region": "us-east1" }
+      },
+      {
+        "source": "/privacy",
+        "run": { "serviceId": "coach-claude", "region": "us-east1" }
+      },
+      {
+        "source": "/terms-and-conditions",
+        "run": { "serviceId": "coach-claude", "region": "us-east1" }
+      },
       { "source": "**", "destination": "/index.html" }
     ],
     "headers": [
