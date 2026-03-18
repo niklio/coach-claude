@@ -1218,6 +1218,14 @@ def chat_auth():
 # OTP — send and verify one-time codes via SMS
 # ---------------------------------------------------------------------------
 
+_VERIFY_SERVICE_SID = os.getenv("TWILIO_VERIFY_SERVICE_SID", "VAdd11ac1eb6560c3bc2322954e3d63271")
+
+
+def _verify_client():
+    from twilio.rest import Client
+    return Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+
+
 @app.route("/otp/send", methods=["POST"])
 def otp_send():
     data = request.get_json(force=True) or {}
@@ -1232,18 +1240,16 @@ def otp_send():
     if phone not in ALLOWED_PHONES:
         return jsonify({"ok": False, "error": "This number is not on the allowed list."}), 403
 
-    code = str(random.randint(100000, 999999))
-    session["otp_code"] = code
-    session["otp_expires"] = int(time.time()) + 600
     session["otp_phone"] = phone
     session["otp_purpose"] = purpose
-    # Store name during onboarding so /onboarding can read it from session
     name = (data.get("name") or "").strip()
     if name:
         session["otp_name"] = name
 
     try:
-        sms_sender._send(phone, f"Your Coach Claude code is {code}. Valid for 10 minutes.")
+        _verify_client().verify.v2.services(_VERIFY_SERVICE_SID).verifications.create(
+            to=phone, channel="sms"
+        )
     except Exception as exc:
         log.error("OTP send failed to %s: %s", phone, exc)
         return jsonify({"ok": False, "error": "Failed to send SMS. Please try again."}), 500
@@ -1256,26 +1262,24 @@ def otp_verify():
     data = request.get_json(force=True) or {}
     entered = (data.get("code") or "").strip()
 
-    stored_code = session.get("otp_code")
-    stored_expires = session.get("otp_expires")
     purpose = session.get("otp_purpose", "")
     phone = session.get("otp_phone", "")
 
-    # Always clear OTP from session after an attempt
-    session.pop("otp_code", None)
-    session.pop("otp_expires", None)
+    if not phone:
+        return jsonify({"ok": False, "error": "No pending verification. Please request a new code."}), 400
 
-    if not stored_code or not stored_expires:
-        return jsonify({"ok": False, "error": "No code found. Please request a new one."}), 400
+    try:
+        check = _verify_client().verify.v2.services(_VERIFY_SERVICE_SID).verification_checks.create(
+            to=phone, code=entered
+        )
+    except Exception as exc:
+        log.error("OTP verify failed for %s: %s", phone, exc)
+        return jsonify({"ok": False, "error": "Invalid or expired code."}), 400
 
-    if int(time.time()) > stored_expires:
-        return jsonify({"ok": False, "error": "Code has expired. Please request a new one."}), 400
-
-    if entered != stored_code:
+    if check.status != "approved":
         return jsonify({"ok": False, "error": "Invalid or expired code."}), 400
 
     session["otp_verified"] = True
-    # For onboarding: persist phone + name so /chat/auth can read from session
     if purpose == "onboarding":
         session["pending_phone"] = phone
         session["pending_name"] = session.pop("otp_name", "")
