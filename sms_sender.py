@@ -32,12 +32,13 @@ def _client() -> Client:
 
 
 def _send(to: str, body: str) -> None:
-    """Send an SMS. Attaches a status_callback if PUBLIC_URL is set."""
-    kwargs: dict = {
-        "body": body,
-        "from_": os.getenv("TWILIO_FROM_NUMBER"),
-        "to": to,
-    }
+    """Send an SMS via the A2P Messaging Service if configured, else fall back to raw number."""
+    kwargs: dict = {"body": body, "to": to}
+    messaging_service_sid = os.getenv("TWILIO_MESSAGING_SERVICE_SID")
+    if messaging_service_sid:
+        kwargs["messaging_service_sid"] = messaging_service_sid
+    else:
+        kwargs["from_"] = os.getenv("TWILIO_FROM_NUMBER")
     public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
     if public_url:
         kwargs["status_callback"] = f"{public_url}/sms/status"
