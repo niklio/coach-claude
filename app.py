@@ -1246,15 +1246,14 @@ def otp_send():
     if name:
         session["otp_name"] = name
 
-    try:
-        _verify_client().verify.v2.services(_VERIFY_SERVICE_SID).verifications.create(
-            to=phone, channel="sms"
-        )
-    except Exception as exc:
-        log.error("OTP send failed to %s: %s", phone, exc)
-        return jsonify({"ok": False, "error": "Failed to send SMS. Please try again."}), 500
-
-    return jsonify({"ok": True})
+    # For private beta: ALLOWED_PHONES users are pre-trusted — skip SMS and
+    # mark them verified immediately so the code-entry step is bypassed.
+    session["otp_verified"] = True
+    if purpose == "onboarding":
+        session["pending_phone"] = phone
+        session["pending_name"] = session.get("otp_name", "")
+    log.info("Auto-verified ALLOWED_PHONES user %s (purpose=%s)", phone, purpose)
+    return jsonify({"ok": True, "auto_verified": True, "purpose": purpose, "phone": phone})
 
 
 @app.route("/otp/verify", methods=["POST"])
@@ -1398,9 +1397,13 @@ _SIGNUP_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.ok) {
-          stepInfo.classList.add('hidden');
-          stepCode.classList.remove('hidden');
-          codeInput.focus();
+          if (data.auto_verified) {
+            window.location.href = '/onboarding';
+          } else {
+            stepInfo.classList.add('hidden');
+            stepCode.classList.remove('hidden');
+            codeInput.focus();
+          }
         } else {
           infoError.textContent = data.error || 'Failed to send code.';
           sendBtn.disabled = false;
@@ -1564,9 +1567,21 @@ _LOGIN_HTML = """<!DOCTYPE html>
         });
         const data = await res.json();
         if (data.ok) {
-          stepPhone.classList.add('hidden');
-          stepCode.classList.remove('hidden');
-          codeInput.focus();
+          if (data.auto_verified) {
+            const authRes = await fetch('/login/auth', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+            const authData = await authRes.json();
+            if (authData.ok) {
+              window.location.href = '/chat';
+            } else {
+              phoneError.textContent = authData.error || 'Sign-in failed.';
+              sendBtn.disabled = false;
+              sendBtn.textContent = 'Send code';
+            }
+          } else {
+            stepPhone.classList.add('hidden');
+            stepCode.classList.remove('hidden');
+            codeInput.focus();
+          }
         } else {
           phoneError.textContent = data.error || 'Failed to send code.';
           sendBtn.disabled = false;
